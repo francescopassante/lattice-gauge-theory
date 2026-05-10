@@ -1,49 +1,94 @@
+from pathlib import Path
+from typing import Optional, Sequence
+
 import torch
 from torch.utils.data import TensorDataset, random_split
 
-from lattice import Z2, Lattice
+from lattice import (
+    GaugeGroup,
+    Z2,
+    action,
+    as_ml_input,
+    as_ml_plaquettes,
+    plaquette_tensor,
+    random_links,
+)
 
 
-def build_plaquette_datasets(N, D, L, split_percent=[0.7, 0.15, 0.15], save=False):
-    """Build train, val, test datasets with X = [N, D*(D-1)/2, L, .., L] plaquette configuration and y = [N] action"""
-    n_pairs = D * (D - 1) // 2
-    X = torch.zeros((N, n_pairs) + (L,) * D)
-    y = torch.zeros(N)
+def build_link_datasets(
+    N: int,
+    D: int,
+    L: int,
+    group: Optional[GaugeGroup] = None,
+    beta: float = 1.0,
+    splits: Sequence[float] = (0.7, 0.15, 0.15),
+    save: bool = False,
+    seed: Optional[int] = None,
+    dtype: torch.dtype = torch.float32,
+):
+    """Dataset of (link configuration, action). X shape ``(N, D · nc², *Λ)``."""
+    group = group if group is not None else Z2()
+    generator = _make_generator(seed)
 
+    sample_x = as_ml_input(random_links(L, D, group, generator, dtype=dtype))
+    X = torch.zeros((N,) + sample_x.shape, dtype=sample_x.dtype)
+    y = torch.zeros(N, dtype=dtype)
+
+    # Reset generator so iteration 0 is reproducible (we already drew a sample above).
+    generator = _make_generator(seed)
     for i in range(N):
-        lat = Lattice(L=L, D=D, gaugegroup=Z2()).initialize_random_links()
-        plaq = lat.plaquette_tensor()
-        X[i] = plaq
-        y[i] = lat.action(plaq)
+        U = random_links(L, D, group, generator, dtype=dtype)
+        X[i] = as_ml_input(U)
+        y[i] = action(U, group, beta=beta)
 
-    full_dataset = TensorDataset(X, y)
-    train_dataset, val_dataset, test_dataset = random_split(full_dataset, split_percent)
-
-    if save:
-        torch.save(train_dataset, "datasets/train_dataset_plaquette.pt")
-        torch.save(val_dataset, "datasets/val_dataset_plaquette.pt")
-        torch.save(test_dataset, "datasets/test_dataset_plaquette.pt")
-
-    return train_dataset, val_dataset, test_dataset
+    return _split(X, y, splits, save, prefix=f"{group.name.lower()}_link", generator=generator)
 
 
-def build_link_datasets(N, D, L, split_percent=[0.7, 0.15, 0.15], save=False):
-    """Build train, val, test datasets with X = [N, D, L, .., L] link configuration and y = [N] action"""
-    n_links = D
-    X = torch.zeros((N, n_links) + (L,) * D)
-    y = torch.zeros(N)
+def build_plaquette_datasets(
+    N: int,
+    D: int,
+    L: int,
+    group: Optional[GaugeGroup] = None,
+    beta: float = 1.0,
+    splits: Sequence[float] = (0.7, 0.15, 0.15),
+    save: bool = False,
+    seed: Optional[int] = None,
+    dtype: torch.dtype = torch.float32,
+):
+    """Dataset of (plaquette configuration, action). X shape ``(N, n_pairs · nc², *Λ)``."""
+    group = group if group is not None else Z2()
+    generator = _make_generator(seed)
 
+    sample_x = as_ml_plaquettes(
+        plaquette_tensor(random_links(L, D, group, generator, dtype=dtype), group)
+    )
+    X = torch.zeros((N,) + sample_x.shape, dtype=sample_x.dtype)
+    y = torch.zeros(N, dtype=dtype)
+
+    generator = _make_generator(seed)
     for i in range(N):
-        lat = Lattice(L=L, D=D, gaugegroup=Z2()).initialize_random_links()
-        X[i] = lat.link_tensor()
-        y[i] = lat.action()
+        U = random_links(L, D, group, generator, dtype=dtype)
+        P = plaquette_tensor(U, group)
+        X[i] = as_ml_plaquettes(P)
+        y[i] = action(U, group, beta=beta, plaquettes=P)
 
-    full_dataset = TensorDataset(X, y)
-    train_dataset, val_dataset, test_dataset = random_split(full_dataset, split_percent)
+    return _split(X, y, splits, save, prefix=f"{group.name.lower()}_plaquette", generator=generator)
 
+
+def _make_generator(seed: Optional[int]) -> torch.Generator:
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
+    return g
+
+
+def _split(X, y, splits, save, prefix, generator):
+    full = TensorDataset(X, y)
+    train, val, test = random_split(full, list(splits), generator=generator)
     if save:
-        torch.save(train_dataset, "datasets/train_dataset_link.pt")
-        torch.save(val_dataset, "datasets/val_dataset_link.pt")
-        torch.save(test_dataset, "datasets/test_dataset_link.pt")
-
-    return train_dataset, val_dataset, test_dataset
+        out_dir = Path("datasets")
+        out_dir.mkdir(exist_ok=True)
+        torch.save(train, out_dir / f"train_dataset_{prefix}.pt")
+        torch.save(val, out_dir / f"val_dataset_{prefix}.pt")
+        torch.save(test, out_dir / f"test_dataset_{prefix}.pt")
+    return train, val, test

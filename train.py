@@ -1,9 +1,18 @@
+from collections import namedtuple
+from typing import Optional, Sequence
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
+from lattice import GaugeGroup, Z2
 from model import LatticeCNN
+
+TrainResult = namedtuple(
+    "TrainResult",
+    ["test_loss", "test_label_var", "test_r2", "epochs", "train_losses", "val_losses"],
+)
 
 
 def train_model(
@@ -16,6 +25,7 @@ def train_model(
     epochs,
     verbose=True,
     patience=5,
+    checkpoint_path: str = "best_model.pth",
 ):
     best_val_loss = float("inf")
     train_losses = []
@@ -25,7 +35,7 @@ def train_model(
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
-        wrap = tqdm if verbose else lambda x: x
+        wrap = tqdm if verbose else (lambda x: x)
         for inputs, targets in wrap(train_loader):
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
@@ -52,7 +62,7 @@ def train_model(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), "best_model.pth")
+            torch.save(model.state_dict(), checkpoint_path)
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
@@ -71,37 +81,50 @@ def train_model(
 
 
 def full_pipeline(
-    L,
-    D,
-    N,
-    channel_dimensions,
-    splits=[0.7, 0.15, 0.15],
-    lr=1e-3,
-    epochs=100,
-    patience=10,
-    plots=False,
-    verbose=True,
-    input="plaquette",
-):
+    L: int,
+    D: int,
+    N: int,
+    hidden_channels: Sequence[int],
+    group: Optional[GaugeGroup] = None,
+    beta: float = 1.0,
+    splits: Sequence[float] = (0.7, 0.15, 0.15),
+    lr: float = 1e-3,
+    epochs: int = 100,
+    patience: int = 10,
+    plots: bool = False,
+    verbose: bool = True,
+    input: str = "plaquette",
+    seed: Optional[int] = None,
+    checkpoint_path: str = "best_model.pth",
+) -> TrainResult:
     from data import build_link_datasets, build_plaquette_datasets
 
-    if input.lower() == "plaquette":
-        train_dataset, val_dataset, test_dataset = build_plaquette_datasets(
-            N, D, L, splits
-        )
-    else:
-        train_dataset, val_dataset, test_dataset = build_link_datasets(N, D, L, splits)
+    group = group if group is not None else Z2()
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=32, shuffle=True
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    builder = build_plaquette_datasets if input.lower() == "plaquette" else build_link_datasets
+    train_dataset, val_dataset, test_dataset = builder(
+        N, D, L, group=group, beta=beta, splits=splits, seed=seed
     )
+
+    # Derive in_channels from the actual data instead of hard-coding it.
+    sample_x, _ = train_dataset[0]
+    in_channels = sample_x.shape[0]
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=32, shuffle=False)
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=32, shuffle=False
-    )
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-    model = LatticeCNN(L, D, channel_dimensions)
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    model = LatticeCNN(L, D, in_channels=in_channels, hidden_channels=hidden_channels)
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu"
+    )
     model = model.to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -116,16 +139,17 @@ def full_pipeline(
         epochs=epochs,
         patience=patience,
         verbose=verbose,
+        checkpoint_path=checkpoint_path,
     )
 
-    model.load_state_dict(torch.load("best_model.pth", weights_only=True))
+    model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
     model.eval()
 
     test_loss = 0.0
     all_targets = []
     all_outputs = []
     with torch.no_grad():
-        wrap = tqdm if verbose else lambda x: x
+        wrap = tqdm if verbose else (lambda x: x)
         for inputs, targets in wrap(test_loader):
             inputs, targets = inputs.to(device), targets.to(device)
             outputs = model(inputs)
@@ -135,11 +159,16 @@ def full_pipeline(
             all_outputs.append(outputs.cpu())
 
     test_loss /= len(test_loader)
-    if verbose:
-        print(f"Test Loss: {test_loss:.4f}")
+    all_targets = torch.cat(all_targets)
+    all_outputs = torch.cat(all_outputs)
+    # Population variance of the labels — the natural scale to normalise MSE by.
+    test_label_var = all_targets.var(unbiased=False).item()
+    test_r2 = 1.0 - test_loss / test_label_var if test_label_var > 0 else float("nan")
 
-    all_targets = torch.cat(all_targets).numpy()
-    all_outputs = torch.cat(all_outputs).numpy()
+    if verbose:
+        print(
+            f"Test Loss: {test_loss:.4f} | Var(y): {test_label_var:.4f} | R²: {test_r2:.4f}"
+        )
 
     if plots:
         import matplotlib.pyplot as plt
@@ -156,11 +185,18 @@ def full_pipeline(
         plt.show()
 
         plt.figure(figsize=(8, 8))
-        plt.scatter(all_targets, all_outputs, alpha=0.5)
+        plt.scatter(all_targets.numpy(), all_outputs.numpy(), alpha=0.5)
         plt.xlabel("True Values")
         plt.ylabel("Predictions")
         plt.title("True vs Predicted Values (Test Set)")
         plt.grid(True)
         plt.show()
 
-    return test_loss, full_epochs
+    return TrainResult(
+        test_loss=test_loss,
+        test_label_var=test_label_var,
+        test_r2=test_r2,
+        epochs=full_epochs,
+        train_losses=train_losses,
+        val_losses=val_losses,
+    )

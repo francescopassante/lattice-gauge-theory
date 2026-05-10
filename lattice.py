@@ -1,195 +1,152 @@
-from abc import ABC, abstractmethod
+"""Lattice gauge theory primitives as pure tensor operations.
 
-import numpy as np
+Conventions
+-----------
+- Link tensor shape: ``(D, L, ..., L, nc, nc)`` where the leading axis indexes
+  the spatial direction ``μ ∈ {0, ..., D-1}``, the middle ``D`` axes are the
+  spatial coordinates, and the trailing ``(nc, nc)`` axes are the matrix
+  representation of the link in the gauge group's defining representation.
+- Even for Z₂ (where ``nc = 1``) the trailing color axes are kept so that
+  every operation generalises verbatim to U(1) / SU(N). The dagger is written
+  out explicitly for the same reason.
+- Plaquette tensor shape: ``(D(D-1)/2, L, ..., L, nc, nc)``, ordered by
+  ``(μ, ν)`` pairs with ``μ < ν`` lexicographically.
+- Plaquette convention:
+  ``P_{μν}(x) = U_μ(x) · U_ν(x + μ̂) · U_μ†(x + ν̂) · U_ν†(x)``.
+- Periodic boundary conditions throughout (``torch.roll`` for shifts).
+"""
+
+from abc import ABC, abstractmethod
+from typing import Optional, Tuple
+
 import torch
 
 
 class GaugeGroup(ABC):
-    def __init__(self, name):
-        self.name = name
+    """Abstract gauge group, parametrised by its defining-representation dimension ``nc``."""
 
-    def __str__(self):
+    name: str
+    nc: int
+
+    def __str__(self) -> str:
         return self.name
 
     @abstractmethod
-    def multiply(self, *operators):
-        pass
+    def random(
+        self,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        """Sample group elements as a tensor of shape ``shape + (nc, nc)`` (Haar)."""
 
     @abstractmethod
-    def inverse(self, U):
-        pass
-
-    @abstractmethod
-    def tensor_inverse(self, U: torch.Tensor) -> torch.Tensor:
-        """Element-wise inverse of a tensor of group elements."""
-        pass
+    def dagger(self, U: torch.Tensor) -> torch.Tensor:
+        """Hermitian conjugate (= group inverse for unitary groups)."""
 
 
 class Z2(GaugeGroup):
-    def __init__(self):
-        super().__init__("Z2")
+    name = "Z2"
+    nc = 1
 
-    def multiply(self, *operators):
-        prod = 1
-        for op in operators:
-            prod *= op
-        return prod
+    def random(self, shape, dtype=torch.float32):
+        signs = (torch.randint(0, 2, shape, dtype=torch.int64) * 2 - 1).to(dtype)
+        # Add the trailing (nc, nc) = (1, 1) color axes so that the layout matches U(1)/SU(N).
+        return signs.unsqueeze(-1).unsqueeze(-1)
 
-    def inverse(self, U):
-        return U
-
-    def tensor_inverse(self, U: torch.Tensor) -> torch.Tensor:
-        return U  # Z2 elements are self-inverse (±1)
+    def dagger(self, U):
+        # Identity for real 1×1 matrices, but written explicitly for portability.
+        return U.conj().transpose(-1, -2)
 
 
-class Site:
-    def __init__(self, features=None):
-        self.features = features
+def random_links(
+    L: int,
+    D: int,
+    group: GaugeGroup,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Sample a Haar-random link configuration of shape ``(D, L, ..., L, nc, nc)``."""
+    return group.random((D,) + (L,) * D, dtype=dtype)
 
 
-class Link:
-    def __init__(self, U, direction, gaugegroup, D):
-        self.operator = U
-        self.direction = direction
-        self.gaugegroup = gaugegroup
-        self.D = D
+def plaquette_tensor(U: torch.Tensor, group: GaugeGroup) -> torch.Tensor:
+    """Compute every 1×1 plaquette ``P_{μν}(x)`` for ``μ < ν``.
 
-    def inverse(self):
-        """Returns the inverse link.
+    Parameters
+    ----------
+    U
+        Links of shape ``(D, *Λ, nc, nc)`` where ``*Λ`` is the spatial shape.
+    group
+        Gauge group (used for the dagger operation).
 
-        Direction encoding: mu=0,...,D-1 forward along axis mu; mu=D,...,2D-1 backward along axis mu%D.
-        """
-        inverse_direction = (
-            self.direction + self.D
-            if self.direction < self.D
-            else self.direction - self.D
-        )
-        return Link(
-            U=self.gaugegroup.inverse(self.operator),
-            direction=inverse_direction,
-            gaugegroup=self.gaugegroup,
-            D=self.D,
-        )
-
-    def __mul__(self, other):
-        return Link(
-            U=self.gaugegroup.multiply(self.operator, other.operator),
-            direction=None,
-            gaugegroup=self.gaugegroup,
-            D=self.D,
-        )
-
-    def __str__(self):
-        return f"Link direction: {self.direction}, value: {self.operator}"
+    Returns
+    -------
+    Tensor of shape ``(n_pairs, *Λ, nc, nc)`` with ``n_pairs = D(D-1)/2``.
+    """
+    D = U.shape[0]
+    pairs = [(mu, nu) for mu in range(D) for nu in range(mu + 1, D)]
+    plaqs = []
+    for mu, nu in pairs:
+        # After indexing U[mu] / U[nu], the spatial axis ``mu`` sits at index ``mu``
+        # (axes 0..D-1 are spatial, then nc, nc). torch.roll(t, -1, dims=mu) brings
+        # the value at lattice position ``x + μ̂`` to index ``x``.
+        Umu = U[mu]
+        Unu = U[nu]
+        Unu_shift_mu = torch.roll(Unu, shifts=-1, dims=mu)  # U_ν(x + μ̂)
+        Umu_shift_nu = torch.roll(Umu, shifts=-1, dims=nu)  # U_μ(x + ν̂)
+        P = Umu @ Unu_shift_mu @ group.dagger(Umu_shift_nu) @ group.dagger(Unu)
+        plaqs.append(P)
+    return torch.stack(plaqs, dim=0)
 
 
-class Plaquette:
-    def __init__(self, P, position, dir1, dir2):
-        self.P = P
-        self.position = position
-        self.dir1 = dir1
-        self.dir2 = dir2
+def action(
+    U: torch.Tensor,
+    group: GaugeGroup,
+    beta: float = 1.0,
+    plaquettes: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Wilson action ``S = β Σ_p (1 − Re Tr P_p / N_c)``.
 
-    @classmethod
-    def from_links(cls, link1, link2, link3, link4, position, dir1, dir2):
-        P = link1.gaugegroup.multiply(
-            link1.operator, link2.operator, link3.operator, link4.operator
-        )
-        return cls(P, position, dir1, dir2)
+    Parameters
+    ----------
+    U
+        Link tensor (ignored if ``plaquettes`` is provided).
+    group
+        Gauge group (used to compute plaquettes if needed).
+    beta
+        Coupling. Default 1.0 reproduces the unnormalised ``n_plaq − Σ P`` form
+        used by the original baseline experiments.
+    plaquettes
+        Pre-computed plaquette tensor; if ``None`` it is computed from ``U``.
+    """
+    P = plaquettes if plaquettes is not None else plaquette_tensor(U, group)
+    re_tr_over_nc = P.diagonal(dim1=-2, dim2=-1).sum(dim=-1).real / group.nc
+    n_plaq = re_tr_over_nc.numel()
+    return beta * (n_plaq - re_tr_over_nc.sum())
 
 
-class Lattice:
-    """Class to manipulate lattices"""
+def as_ml_input(U: torch.Tensor) -> torch.Tensor:
+    """Flatten a link tensor ``(D, *Λ, nc, nc)`` into ML input ``(C, *Λ)``.
 
-    def __init__(self, L, D=2, gaugegroup=None):
-        assert D > 0 and L > 0
-        if gaugegroup is None:
-            gaugegroup = Z2()
-        self.L = L
-        self.D = D
-        self.gaugegroup = gaugegroup
+    Real groups: ``C = D · nc²``.
+    Complex groups: ``C = 2 · D · nc²`` (real and imaginary parts as separate channels).
+    For Z₂ (``nc = 1``, real) the output collapses to ``(D, *Λ)``, matching the
+    legacy CNN baseline interface.
+    """
+    D = U.shape[0]
+    spatial = U.shape[1:-2]
+    nc = U.shape[-1]
+    if torch.is_complex(U):
+        re_im = torch.stack([U.real, U.imag], dim=1)  # (D, 2, *Λ, nc, nc)
+        return re_im.reshape(D * 2 * nc * nc, *spatial)
+    return U.reshape(D * nc * nc, *spatial)
 
-        self.lattice_sites = np.empty(shape=(L,) * D, dtype=Site)
-        for coord in np.ndindex(self.lattice_sites.shape):
-            self.lattice_sites[*coord] = Site()
 
-    def initialize_random_links(self):
-        """Initialize all links to be either +1 or -1 with 50% chance. (Haar)"""
-        self.links = np.empty(shape=(self.D,) + (self.L,) * self.D, dtype=Link)
-        for coord in np.ndindex(self.lattice_sites.shape):
-            for i in range(self.D):
-                self.links[i, *coord] = Link(
-                    U=(1 if np.random.random() < 0.5 else -1),
-                    direction=i,
-                    gaugegroup=self.gaugegroup,
-                    D=self.D,
-                )
-        return self
-
-    def get_link(self, position, direction) -> Link:
-        """Return link at specified position and direction"""
-        assert len(position) == self.D
-        assert sum([0 <= position[i] < self.L for i in range(self.D)]) == self.D
-        assert 0 <= direction < self.D
-
-        return self.links[direction, *position]
-
-    def get_site(self, position):
-        """Return site at specified position"""
-        assert len(position) == self.D
-        assert sum([0 <= position[i] < self.L for i in range(self.D)]) == self.D
-
-        return self.lattice_sites[*position]
-
-    def plaquette(self, position, mu, nu):
-        """Return the plaquette P_munu at position position and directions mu, nu"""
-        assert len(position) == self.D
-        assert sum([0 <= position[i] < self.L for i in range(self.D)]) == self.D
-        assert 0 <= mu < self.D
-        assert 0 <= nu < self.D
-        assert mu != nu
-
-        position = np.array(position)
-
-        mu_vec = np.zeros(self.D, dtype=np.int64)
-        nu_vec = np.zeros(self.D, dtype=np.int64)
-        mu_vec[mu] = 1
-        nu_vec[nu] = 1
-        return Plaquette.from_links(
-            self.links[mu, *position],
-            self.links[nu, *((position + mu_vec) % self.L)],
-            self.links[mu, *((position + nu_vec) % self.L)].inverse(),
-            self.links[nu, *position].inverse(),
-            position,
-            mu,
-            nu,
-        )
-
-    def link_tensor(self) -> torch.Tensor:
-        """Extract link operators into a float tensor of shape (D, L, ..., L)."""
-        ops = np.vectorize(lambda l: l.operator)(
-            self.links
-        )  # shape (D,L,...,L). vectorize to apply to multidim array, not faster
-        return torch.tensor(ops, dtype=torch.float32)
-
-    def plaquette_tensor(self) -> torch.Tensor:
-        """Return the (D*(D-1)//2, L, ..., L) tensor of unique plaquette values."""
-        U = self.link_tensor()  # (D, L, ..., L)
-        pairs = [(mu, nu) for mu in range(self.D) for nu in range(mu + 1, self.D)]
-        tensor = torch.empty((len(pairs),) + (self.L,) * self.D)
-        for k, (mu, nu) in enumerate(pairs):
-            # P_{mu,nu}(x) = U_mu(x) * U_nu(x+e_mu) * U_mu^{-1}(x+e_nu) * U_nu^{-1}(x)
-            tensor[k] = (
-                U[mu]
-                * torch.roll(U[nu], -1, mu)
-                * self.gaugegroup.tensor_inverse(torch.roll(U[mu], -1, nu))
-                * self.gaugegroup.tensor_inverse(U[nu])
-            )
-        return tensor
-
-    def action(self, plaq=None) -> torch.Tensor:
-        if plaq is None:
-            plaq = self.plaquette_tensor()
-        n_plaq = self.L**self.D * self.D * (self.D - 1) // 2
-        # equivalent to sum_p (1 - P_p)
-        return n_plaq - torch.sum(plaq)
+def as_ml_plaquettes(P: torch.Tensor) -> torch.Tensor:
+    """Same flattening as :func:`as_ml_input` for the plaquette tensor."""
+    n_pairs = P.shape[0]
+    spatial = P.shape[1:-2]
+    nc = P.shape[-1]
+    if torch.is_complex(P):
+        re_im = torch.stack([P.real, P.imag], dim=1)
+        return re_im.reshape(n_pairs * 2 * nc * nc, *spatial)
+    return P.reshape(n_pairs * nc * nc, *spatial)
