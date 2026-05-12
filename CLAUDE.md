@@ -162,10 +162,7 @@ reachable until Metropolis MC is in place.
 - **Saved `best_model.pth` from before the refactor is from a Haar-random
   run with no β** — not useful as a checkpoint for any equivariant
   experiment.
-- **Stale PNGs from the old `L_scan_plots.py`** (`Test loss vs L_links.png`
-  etc.) are still on disk; the new script produces consolidated
-  `Test loss vs L_absolute.png`, `Test R2 vs L.png`, and
-  `Train epochs vs L.png`. Delete the old ones if you want a clean tree.
+- **Do not remove comments unless asked to**
 
 ## Suggested next steps
 

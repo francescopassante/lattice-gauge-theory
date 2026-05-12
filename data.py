@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 from torch.utils.data import TensorDataset, random_split
@@ -12,6 +12,7 @@ from lattice import (
     plaquette_tensor,
     random_links,
 )
+from sampler import generate_ensemble
 
 
 def build_link_datasets(
@@ -70,6 +71,61 @@ def build_plaquette_datasets(
     prefix = _dataset_prefix(
         group.name.lower(), "plaquette", L, D, N, beta, dtype, structured
     )
+    return _split(X, y, splits, save, prefix=prefix)
+
+
+def build_mc_link_datasets(
+    N: int,
+    D: int,
+    L: int,
+    group: GaugeGroup,
+    beta: float = 1.0,
+    n_therm: int = 200,
+    n_skip: int = 5,
+    splits: Sequence[float] = (0.7, 0.15, 0.15),
+    save: bool = False,
+    seed: Optional[int] = None,
+    dtype: torch.dtype = torch.float32,
+    structured: bool = True,
+):
+    """Dataset of (link config, action) drawn from the Boltzmann distribution.
+
+    Replaces Haar-random sampling with Metropolis MC at inverse coupling ``beta``.
+    Same interface as ``build_link_datasets`` except ``seed`` controls the MC chain.
+    """
+    configs, _ = generate_ensemble(
+        L, D, group, beta, N, n_therm=n_therm, n_skip=n_skip, seed=seed, dtype=dtype,
+    )  # (N, D, *Λ, nc, nc)
+    X = configs if structured else torch.stack([as_ml_input(c) for c in configs])
+    y = torch.stack([action(c, group, beta=beta) for c in configs])
+
+    prefix = _dataset_prefix(group.name.lower(), "mc_link", L, D, N, beta, dtype, structured)
+    return _split(X, y, splits, save, prefix=prefix)
+
+
+def build_mc_plaquette_datasets(
+    N: int,
+    D: int,
+    L: int,
+    group: GaugeGroup,
+    beta: float = 1.0,
+    n_therm: int = 200,
+    n_skip: int = 5,
+    splits: Sequence[float] = (0.7, 0.15, 0.15),
+    save: bool = False,
+    seed: Optional[int] = None,
+    dtype: torch.dtype = torch.float32,
+    structured: bool = False,
+):
+    """Dataset of (plaquette config, action) drawn from the Boltzmann distribution."""
+    configs, _ = generate_ensemble(
+        L, D, group, beta, N, n_therm=n_therm, n_skip=n_skip, seed=seed, dtype=dtype,
+    )  # (N, D, *Λ, nc, nc)
+    Ps = torch.stack([plaquette_tensor(c, group) for c in configs])
+    X  = Ps if structured else torch.stack([as_ml_plaquettes(p) for p in Ps])
+    y  = torch.stack([action(configs[i], group, beta=beta, plaquettes=Ps[i]) for i in range(N)])
+
+    prefix = _dataset_prefix(group.name.lower(), "mc_plaquette", L, D, N, beta, dtype, structured)
     return _split(X, y, splits, save, prefix=prefix)
 
 
