@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from tqdm import tqdm
 
 from lattice import Z2
@@ -10,6 +11,7 @@ if __name__ == "__main__":
     L = 8
     D = 2
     N = 1000
+    seed = 0
     hidden_channels = [16, 32]
     lrs = np.logspace(-2, -5, 7)  # 1e-2 … 1e-5, seven points
 
@@ -21,6 +23,7 @@ if __name__ == "__main__":
     val_losses_all = []
 
     for i, lr in enumerate(tqdm(lrs)):
+        torch.manual_seed(seed)
         model = LatticeCNN(L, D, in_channels=1, hidden_channels=hidden_channels)
         result = full_pipeline(
             L=L,
@@ -35,7 +38,7 @@ if __name__ == "__main__":
             plots=False,
             verbose=True,
             input="plaquettes",
-            seed=0,
+            seed=seed,
             checkpoint_path=f"best_model_lr{lr:.0e}.pth",
         )
         test_losses[i] = result["test_loss"]

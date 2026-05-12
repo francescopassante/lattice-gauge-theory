@@ -22,6 +22,8 @@ class LatticeCNN(nn.Module):
         super().__init__()
         if D != 2:
             raise NotImplementedError("LatticeCNN currently uses Conv2d (D=2 only).")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be a positive odd integer.")
         self.L = L
         self.D = D
         self.in_channels = in_channels
@@ -34,7 +36,7 @@ class LatticeCNN(nn.Module):
                     chan_in,
                     chan_out,
                     kernel_size=kernel_size,
-                    padding=1,
+                    padding=kernel_size // 2,
                     padding_mode="circular",
                 )
             )

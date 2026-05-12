@@ -46,16 +46,13 @@ meaningful as a baseline.
 What still does **not** exist (in priority order, per
 `architecture.md` §10 + `roadmap.md` Phase 0):
 
-1. `gauge_transform(U, Ω)` and the corresponding gauge-invariance unit
-   tests. This is the single hardest gate before any equivariant work.
-2. Metropolis (or heat-bath) MC sampler — needed for any β-dependent
-   observable. Without it, the action labels carry no physics signal.
-3. The **G-GAT block** itself.
-4. Gauge-implementation stress-test validation (`architecture.md` §7).
+1. The **G-GAT block** itself.
+2. Gauge-implementation stress-test validation (`architecture.md` §7).
+3. Non-Z₂ gauge groups and their production samplers.
 
-Current data are Haar-random (uniform ±1 per link), which is fine for
-sanity checks and for the CNN baseline but cannot reach any physics
-result. See "Why the saved L-scan losses are not signal" below.
+The default dataset path now uses the Z₂ Metropolis sampler. Haar-random
+data remain available via `sampler=haar_ensemble`, and the saved L-scan
+numbers below are still Haar-random baseline results.
 
 ## Layout
 
@@ -69,16 +66,16 @@ result. See "Why the saved L-scan losses are not signal" below.
     axes for ML input. Real groups give `(D · nc², *Λ)`; complex groups
     split real/imag, giving `(2 · D · nc², *Λ)`.
 - **`data.py`** — `build_link_datasets`, `build_plaquette_datasets`. Take
-  `seed`, `dtype`, `group`, `beta`. 
+  `dtype`, `group`, `beta`, sampler controls, and validated split fractions.
   `save=True` writes
   to `datasets/`.
 - **`model.py`** — `LatticeCNN(L, D, in_channels, hidden_channels)`.
   CNN baseline only; circular-padded `Conv2d`. Not gauge-equivariant —
   this is the reference against which the G-GAT will be compared.
 - **`train.py`** — `train_model` (early stopping, configurable
-  `checkpoint_path`); `full_pipeline` returns a `TrainResult` namedtuple
-  with `test_loss`, `test_label_var`, `test_r2`, `epochs`, and the
-  loss curves. Device order: cuda → mps → cpu.
+  `checkpoint_path`); `full_pipeline` returns a dict with `test_loss`,
+  `test_label_var`, `test_r2`, `epochs`, and the loss curves. Device order:
+  cuda → mps → cpu.
 - **`main.py`** — L-scan driver. Seeded; writes per-L checkpoint files
   (`best_model_L{L}.pth`).
 - **`L_scan_plots.py`** — replays the saved pre-refactor L-scan numbers
@@ -105,9 +102,9 @@ result. See "Why the saved L-scan losses are not signal" below.
 - **Wilson action:** `S = β Σ_p (1 − Re Tr P / nc)`. β defaults to 1.0,
   reproducing the legacy unnormalised form `n_plaq − Σ P` for Z₂.
 - **Float32** for training; pass `dtype=torch.float64` through the
-  dataset builders for high-precision gauge-invariance unit tests once
-  `gauge_transform` exists. Worst-case-Ω stress tests (`architecture.md`
-  §7.2) should report drift in double precision.
+  dataset builders for high-precision gauge-invariance unit tests.
+  Worst-case-Ω stress tests (`architecture.md` §7.2) should report drift
+  in double precision.
 
 ## Running
 
@@ -144,8 +141,7 @@ distinct regimes:
 
 This is the inductive-bias gap that motivates the G-GAT. Even a perfect
 action regressor on Haar-random data is only memorising the action
-*function* — nothing physical (β-dependence, phase transitions) is
-reachable until Metropolis MC is in place.
+*function*; β-dependent physics requires the Metropolis data path.
 
 ## Things to keep in mind
 
@@ -156,9 +152,9 @@ reachable until Metropolis MC is in place.
 - **`LatticeCNN` is 2D-only** (`Conv2d` with circular padding); raises
   `NotImplementedError` for `D ≠ 2`. Generalising means switching to
   `Conv3d`/`ConvNd` or factoring the convolution layer.
-- **Datasets do not store β.** Once Metropolis is in, β should become
-  part of the dataset so the model can be conditioned on it (Phase 1+
-  of the roadmap requires this).
+- **Datasets do not store β.** For multi-β training, β should become part
+  of the dataset so the model can be conditioned on it (Phase 1+ of the
+  roadmap requires this).
 - **Saved `best_model.pth` from before the refactor is from a Haar-random
   run with no β** — not useful as a checkpoint for any equivariant
   experiment.
@@ -168,19 +164,12 @@ reachable until Metropolis MC is in place.
 
 In strict order, per `architecture.md` §10 / `roadmap.md` Phase 0:
 
-1. **`gauge_transform(U, Ω)` + invariance unit tests.** Write Ω as
-   `(*Λ, nc, nc)` group elements; transform links by
-   `Ω_x · U_{x,μ} · Ω†_{x+μ̂}`. Unit test: `plaquette_tensor` is bit-equal
-   under transformation in float64. *Do not start anything else before
-   this passes.*
-2. **Metropolis MC.** Single-site updates for Wilson action; track
-   autocorrelation. Replace the Haar-random data path in `data.py`.
-3. **G-GAT block.** Build incrementally per the §10 checklist —
+1. **G-GAT block.** Build incrementally per the §10 checklist —
    covariance unit test after each step (Q/K/V projection, parallel
    transport, score, softmax, multiplicative value, residual + L-Act).
-4. **Gauge-implementation stress test** on the untrained G-GAT before
+2. **Gauge-implementation stress test** on the untrained G-GAT before
    training (`architecture.md` §7) — random Ω + worst-case-Ω search.
    Drift must stay at machine epsilon; anything larger is a bug
    (almost always a missed dagger or a non-axis-aligned transport path).
-5. **Replicate Phase 3 (SU(2) Wilson loops + topological charge)** of
+3. **Replicate Phase 3 (SU(2) Wilson loops + topological charge)** of
    `roadmap.md` once the architecture is validated on Z₂.

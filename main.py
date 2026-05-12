@@ -1,3 +1,5 @@
+import torch
+
 from lattice import Z2
 from model import LatticeCNN
 from train import full_pipeline
@@ -6,8 +8,10 @@ if __name__ == "__main__":
     D = 2
     N = 1000
     L = 32
+    seed = 0
     hidden_channels = [16, 32]
 
+    torch.manual_seed(seed)
     model = LatticeCNN(int(L), D, in_channels=1, hidden_channels=hidden_channels)
     result = full_pipeline(
         L=L,
@@ -23,7 +27,7 @@ if __name__ == "__main__":
         plots=True,
         verbose=True,
         input="plaquettes",
-        seed=0,
+        seed=seed,
         checkpoint_path=f"best_model_L{int(L)}.pth",
         n_therm=200,
         n_skip=5,
