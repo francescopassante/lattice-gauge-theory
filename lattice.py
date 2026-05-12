@@ -152,3 +152,34 @@ def as_ml_plaquettes(P: torch.Tensor) -> torch.Tensor:
         re_im = torch.stack([P.real, P.imag], dim=1)
         return re_im.reshape(n_pairs * 2 * nc * nc, *spatial)
     return P.reshape(n_pairs * nc * nc, *spatial)
+
+
+def gauge_transformation(
+    U: torch.Tensor,
+    omega: torch.Tensor,
+    group: GaugeGroup,
+) -> torch.Tensor:
+    """Apply a site-local gauge transformation Ω to a link configuration.
+
+    For each direction μ:
+        U'_μ(x) = Ω(x) · U_μ(x) · Ω†(x + μ̂)
+
+    Parameters
+    ----------
+    U
+        Link tensor of shape ``(D, *Λ, nc, nc)``.
+    omega
+        Gauge transformation elements of shape ``(*Λ, nc, nc)``.
+    group
+        Gauge group (used for the dagger operation).
+
+    Returns
+    -------
+    Transformed link tensor of the same shape as ``U``.
+    """
+    D = U.shape[0]
+    out = []
+    for mu in range(D):
+        omega_shifted = torch.roll(omega, shifts=-1, dims=mu)  # Ω(x + μ̂)
+        out.append(omega @ U[mu] @ group.dagger(omega_shifted))
+    return torch.stack(out, dim=0)
