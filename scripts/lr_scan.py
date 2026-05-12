@@ -3,9 +3,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from lattice import Z2
-from model import LatticeCNN
-from train import full_pipeline
+from lgt.lattice import Z2
+from lgt.model import LatticeCNN
+from lgt.train import full_pipeline
 
 if __name__ == "__main__":
     L = 8

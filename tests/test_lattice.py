@@ -6,7 +6,7 @@ Run with:  pytest test_lattice.py -v
 import torch
 import pytest
 
-from lattice import Z2, random_links, plaquette_tensor, action, gauge_transformation
+from lgt.lattice import Z2, random_links, plaquette_tensor, action, gauge_transformation
 
 
 @pytest.fixture

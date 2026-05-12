@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
-from lattice import GaugeGroup
+from lgt.lattice import GaugeGroup
 
 
 def train_model(
@@ -106,7 +106,7 @@ def full_pipeline(
                   to the registered sweep for ``group`` via ``_SWEEP_FN``.
                   Pass ``sampler=haar_ensemble`` for Haar-uniform configurations.
     """
-    from data import build_link_datasets, build_plaquette_datasets
+    from lgt.data import build_link_datasets, build_plaquette_datasets
 
     if seed is not None:
         torch.manual_seed(seed)

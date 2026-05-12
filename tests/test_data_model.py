@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from data import _split
-from model import LatticeCNN
+from lgt.data import _split
+from lgt.model import LatticeCNN
 
 
 def test_split_rejects_empty_partition():

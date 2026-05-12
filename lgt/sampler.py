@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from lattice import Z2, GaugeGroup, action, plaquette_tensor, random_links
+from lgt.lattice import Z2, GaugeGroup, action, plaquette_tensor, random_links
 
 
 def staple_sum(U: torch.Tensor, mu: int, group: GaugeGroup) -> torch.Tensor:

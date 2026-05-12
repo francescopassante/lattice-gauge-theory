@@ -4,14 +4,14 @@ from typing import Sequence
 import torch
 from torch.utils.data import TensorDataset, random_split
 
-from lattice import (
+from lgt.lattice import (
     GaugeGroup,
     action,
     as_ml_input,
     as_ml_plaquettes,
     plaquette_tensor,
 )
-from sampler import mcmc_ensemble
+from lgt.sampler import mcmc_ensemble
 
 
 def build_link_datasets(
