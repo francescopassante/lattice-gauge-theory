@@ -196,19 +196,18 @@ loop ordered by `|Δx|_1`.
 
 Per head, per neighbor:
 ```
-s_{x → y, h}  =  (1 / √(N_c · d))  ·  Re Tr [  Σ_a  Q_{x, h, a} · K̃_{y→x, h, a}  ]
+s_{x → y, h}  =  (1 / √(N_c · d))  ·  Re Tr [  Σ_a  Q†_{x, h, a} · K̃_{y→x, h, a}  ]
 ```
 Both factors transform as `Ω_x · (·) · Ω†_x` at site x; `Re Tr` of their
 product is invariant by Tr cyclicity. The `Σ_a` plays the role of the
 "sum over per-head feature channels" of standard attention.
 
-**Note on the score form.** Writing `Tr[Q · K̃]` rather than the
-hermitian-style `Tr[Q† · K̃]` (which would generalize `q† k`) is the
-natural choice when Q is reused as a *left* factor in Sec 3.6: the score
-is `Tr[(left factor) · (transported right factor)]`, i.e. a single closed
-loop trace, consistent with the bilinear in the output. If the score and
-output paths are decoupled later (a separate `Q'` for the bilinear), switch
-to `Re Tr[Q†_a · K̃_a]` for the standard Frobenius-style inner product.
+**Note on the score form.** `Tr[Q† · K̃]` is the natural generalisation of
+the standard attention inner product `q† k` to the matrix setting: it is the
+Frobenius inner product between Q and K̃, maximised when the two are aligned
+in color space. Q† is used consistently in both score and value path (Sec
+3.6). If the score and output paths are decoupled later (a separate `Q'` for
+the output), the same `Re Tr[Q†_a · K̃_a]` form carries over unchanged.
 
 **Relative position bias.** Translation equivariance is automatic from
 weight sharing; per-offset learned scalars are still useful:
@@ -237,14 +236,14 @@ handles the same job cleanly.
 Substituting the transport rule from §3.3 (a similarity transform) into
 the score gives, schematically per head and per feature `a`:
 ```
-s_{x → y, h, a}  ∝  Re Tr [  Q_{x, h, a}  ·  T_{Δx}(x)  ·  K_{y, h, a}  ·  T_{Δx}(x)†  ]
+s_{x → y, h, a}  ∝  Re Tr [  Q†_{x, h, a}  ·  T_{Δx}(x)  ·  K_{y, h, a}  ·  T_{Δx}(x)†  ]
 ```
 where `T_{Δx}(x)` is the shortest-path-averaged Wilson line from `x` to
 `y = x + Δx`. This is exactly the form of the gauge-invariant **two-loop
 correlator** that appears throughout lattice physics — glueball
 propagators, string-tension measurements, and Polyakov-loop correlators
 are all built from objects of the type
-`<Tr[O(x) · U(x, y) · O(y) · U†(x, y)]>`. The G-Attn block is therefore
+`<Tr[O†(x) · U(x, y) · O(y) · U†(x, y)]>`. The G-Attn block is therefore
 asking, at every site and for every neighbor in the L1-ball, "how
 correlated is my local loop content with my neighbor's, after
 parallel-transporting the neighbor into my frame?"
@@ -307,19 +306,21 @@ argument does not depend on the normalization.
 This is the key departure from a vanilla transformer:
 
 ```
-W^{(out)}_{x, h, a}  =  Σ_{y ∈ N(x)}  α_{x → y, h}  ·  Q_{x, h, a}  ·  Ṽ_{y → x, h, a}
+W^{(out)}_{x, h, a}  =  Σ_{y ∈ N(x)}  α_{x → y, h}  ·  Q†_{x, h, a}  ·  Ṽ_{y → x, h, a}
 ```
 
-Both `Q_{x,h,a}` and `Ṽ_{y→x,h,a}` are covariant matrices at site x, so
+Both `Q†_{x,h,a}` and `Ṽ_{y→x,h,a}` are covariant matrices at site x, so
 their product is covariant at x; the scalar α preserves covariance. The
-matrix product `Q · Ṽ` plays exactly the role of L-Bilin's `W · W'` — every
+matrix product `Q† · Ṽ` plays exactly the role of L-Bilin's `W · W'` — every
 block doubles the maximum loop length, so `n_blocks ≥ ⌈log₂(N²)⌉` to express
-an N×N loop.
+an N×N loop. Q† is the reverse-orientation loop with respect to Q; it is still
+a valid covariant matrix and produces a two-loop correlator with the same
+loop-doubling property.
 
-Reuse of Q in both score and output is intentional: the same Q that "queries"
-the loop also closes it, which keeps the score and the bilinear product
-consistent and reduces parameter count. If decoupling is needed later,
-introduce a fourth projection `Q'` for the output side.
+Reuse of Q† in both score and output is intentional: Q† appears as the left
+factor in both `Tr[Q† · K̃]` and `Q† · Ṽ`, keeping the two paths consistent
+and reducing parameter count. If decoupling is needed later, introduce a
+fourth projection `Q'` for the output side.
 
 ### 3.7 Channel mixing back to C output channels
 
@@ -379,7 +380,7 @@ def G_Attn_block(U, W_in, weights):
         Kt      = T_dx @ K_shift @ dagger(T_dx)               # parallel-transported (averaged) K
         Vt_off  = T_dx @ V_shift @ dagger(T_dx)
         # 3.4 score: contract a, take Re Tr
-        prod    = einsum("bhaxmn,bhaxnp->bhaxmp", Q, Kt)
+        prod    = einsum("bhaxnm,bhaxnp->bhaxmp", conj(Q), Kt)  # Q† · K̃
         s       = real(trace(prod, axes=(-2,-1))).sum(axis_a) # (B, H, *Λ)
         s      /= sqrt(Nc * d)
         s      += weights.bias[orbit_of(dx)]  # point-group-tied relative position
@@ -392,8 +393,8 @@ def G_Attn_block(U, W_in, weights):
     # 3.6 multiplicative value path
     W_out_hd = zeros_like(Q)
     for o, dx in enumerate(offsets_in_L1_ball(D+1, R)):
-        # Q · Ṽ is the bilinear; α is a scalar gain
-        W_out_hd += alpha[..., o, None, None] * (Q @ Vt[o])
+        # Q† · Ṽ is the bilinear; α is a scalar gain
+        W_out_hd += alpha[..., o, None, None] * (dagger(Q) @ Vt[o])
 
     # 3.7 channel mix back to C_out
     W_mix = einsum("iha,bhaxmn->bixmn", weights.mix, W_out_hd)
@@ -546,7 +547,7 @@ missed dagger or a non-axis-aligned transport path.
 
 Each G-Attn block produces, at site x, matrices of the form
 ```
-α(invariant) · Q_x · U_P · K^or^V_y · U†_P
+α(invariant) · Q†_x · U_P · K^or^V_y · U†_P
 ```
 i.e. a parallel-transported, attention-weighted bilinear. By the same
 induction as L-CNN's Sec. 3.2 of the Letter:
