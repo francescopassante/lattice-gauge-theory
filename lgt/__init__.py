@@ -7,5 +7,5 @@ from .lattice import (
     plaquette_tensor,
     random_links,
 )
-from .model import LatticeCNN
+from .cnn_baseline import LatticeCNN
 from .sampler import haar_ensemble, mcmc_ensemble

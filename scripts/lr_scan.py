@@ -4,7 +4,7 @@ import torch
 from tqdm import tqdm
 
 from lgt.lattice import Z2
-from lgt.model import LatticeCNN
+from lgt.cnn_baseline import LatticeCNN
 from lgt.train import full_pipeline
 
 if __name__ == "__main__":
