@@ -150,21 +150,41 @@ with `|Δx|_1 = Σ_μ |Δx_μ|` the Manhattan length, and `U_P` the ordered
 product of links along path P. By linearity it transforms as
 `T_Δx(x) → Ω_x · T_Δx(x) · Ω†_{x+Δx}`.
 
-**Compute via DP, not enumeration.** The multinomial
-`|Δx|_1! / Π_μ |Δx_μ|!` paths fold into a recursion on the first step:
-```
-T_Δx(x)  =  Σ_{μ : Δx_μ > 0}  U_{x, μ}  ·  T_{Δx − μ̂}(x + μ̂)
-```
-Build `T_Δx` over the lattice for all Δx in the positive octant of the
-L1-ball, in order of increasing `|Δx|_1`. Cost per new offset: ≤ D+1
-matmuls per site, irrespective of path count.
+The unweighted sum deliberately keeps the multinomial path multiplicity.
+For example, an offset like `(2, 2, 0, 0)` receives six shortest paths while
+`(4, 0, 0, 0)` receives one. This is gauge-covariant and keeps the
+L-CNN-style loop-spanning argument simple, but it also introduces an
+offset-dependent scale asymmetry; normalized transports are a cheap ablation
+once the baseline passes Sec. 9.1.
 
-**Octant trick.** Negative-octant transports are obtained from the
-positive-octant table by
+**Compute via DP, not enumeration.** The multinomial
+`|Δx|_1! / Π_μ |Δx_μ|!` paths fold into a recursion on the first step,
+with the sign of each `Δx_μ` choosing forward or backward link:
+```
+T_Δx(x)  =  Σ_{μ : Δx_μ > 0}  U_μ(x)           ·  T_{Δx − ê_μ}(x + ê_μ)
+          + Σ_{μ : Δx_μ < 0}  U†_μ(x − ê_μ)    ·  T_{Δx + ê_μ}(x − ê_μ)
+```
+Build `T_Δx` over the lattice for **every** signed Δx in the L1-ball of
+radius R, in order of increasing `|Δx|_1`. Sub-offsets `Δx ∓ ê_μ` have
+strictly smaller L1 norm and compatible signs (just one component zeroed
+out, possibly), so a single `|Δx|_1`-ordered pass suffices. Cost per new
+offset: ≤ D+1 matmuls per site, irrespective of path count.
+
+**On the octant trick.** The identity
 ```
 T_{−Δx}(x)  =  dagger( T_Δx(x − Δx) )
 ```
-Cuts compute and memory by ~2^(D+1).
+holds as a property of the math (sum of shortest paths reverses orientation
+under dagger-and-shift), and is exercised by the test suite as a strong
+consistency check. It would let us drop ~half the table by storing only
+"canonical" offsets (e.g. first non-zero component positive), saving 2×
+memory — not the 2^D the receptive field has octants for, because mixed-sign
+offsets like `(1, −1, 0, 0)` mix forward and backward links and cannot be
+derived from any pure-`U` product. We store the full signed L1-ball anyway:
+a single auditable surface for the gauge-implementation stress test (§7.2)
+is worth more than the 2× memory saving, and at the receptive fields we
+care about (R ≤ 3 in 4D, 128 offsets) the table fits comfortably even at
+`16⁴`.
 
 Transport K and V back to x:
 ```
@@ -174,7 +194,7 @@ K̃_{Δx → x, h, a}  =  T_Δx(x) · K_{x + Δx, h, a} · T†_Δx(x)
 Both are locally covariant at x.
 
 **Cost in 4D** (per block, complex64, N_c = 2; memory for storing all
-`T_Δx` in the positive octant — both K and V branches share this table):
+`T_Δx` in the full signed L1-ball — both K and V branches share this table):
 
 | Lattice  | R=2 (40 off.) | R=3 (128 off.) | R=4 (320 off.) |
 |----------|---------------|----------------|----------------|
@@ -214,9 +234,11 @@ weight sharing; per-offset learned scalars are still useful:
 ```
 s_{x → y, h}  +=  b_h(Δx)          (scalar, real, trainable)
 ```
-Optionally tie `b_h` across the lattice point group's orbit of Δx
-(90° rotations + parity) for discrete point-group equivariance at
-near-zero parameter cost — see §12.
+Tie `b_h` across the lattice point group's orbit of Δx (90° rotations +
+parity) by default for isotropic targets such as Wilson loops, action, and
+topological charge. Untie only when the physics distinguishes axes, e.g. a
+finite-temperature setup where temporal and spatial directions should not
+share the same bias.
 
 **On "identity at init" (CASK-style).** The block as a whole acts as the
 identity map at init through the residual (Sec 3.8) combined with small
@@ -297,9 +319,10 @@ For each `(x, h)`, normalize over the neighborhood:
 ```
 α_{x → y, h}  =  exp(s_{x → y, h})  /  Σ_{y' ∈ N(x)} exp(s_{x → y', h})
 ```
-Softmax of invariant scalars stays invariant. If training is unstable,
-fall back to `tanh(s)` without normalization (CASK-style); the loop-doubling
-argument does not depend on the normalization.
+Softmax of invariant scalars stays invariant. For additive local targets
+such as action density or topological charge density, `tanh(s)` without
+normalization (CASK-style) is a peer alternative rather than just a stability
+fallback; the loop-doubling argument does not depend on the normalization.
 
 ### 3.6 Multiplicative value path (L-Bilin baked in)
 
@@ -366,15 +389,15 @@ def G_Attn_block(U, W_in, weights):
     K = einsum("haj,bjxmn->bhaxmn", weights.wK, W_aug)
     V = einsum("haj,bjxmn->bhaxmn", weights.wV, W_aug)
 
-    # 3.3 build shortest-path-averaged transport sums T_Δx for all
-    # Δx in the positive octant of the L1-ball of radius R, via DP
-    # ordered by |Δx|_1. Negative-octant transports derive as
-    # T_{-Δx}(x) = dagger(T_Δx(x - Δx)).
+    # 3.3 build shortest-path-averaged transport sums T_Δx for every
+    # signed Δx in the L1-ball of radius R, via DP ordered by |Δx|_1.
+    # The dict covers the full signed L1-ball; no octant reconstruction
+    # at use sites (the octant identity is exercised in tests, §10 step 1).
     T = build_transport_sums(U, R)        # dict: Δx (tuple) -> (B, *Λ, Nc, Nc)
     scores = []
     Vt = []
     for dx in offsets_in_L1_ball(D+1, R):  # all Δx with 0 < |Δx|_1 ≤ R
-        T_dx    = transport_sum(T, dx)     # uses octant trick + dagger for negatives
+        T_dx    = T[dx]
         K_shift = roll_multi(K, shift=tuple(-d for d in dx))  # bring K_{x+Δx} to index x
         V_shift = roll_multi(V, shift=tuple(-d for d in dx))
         Kt      = T_dx @ K_shift @ dagger(T_dx)               # parallel-transported (averaged) K
@@ -407,6 +430,49 @@ def G_Attn_block(U, W_in, weights):
     return W_act
 ```
 
+### 3.10 Scope: gauge but not point-group equivariance
+
+Every layer above is exactly gauge-equivariant by construction. The block
+as a whole is **not** exactly point-group equivariant, even with the
+orbit-tied position biases of §3.4. The biases make the attention pattern
+over offsets an isotropic prior; they do not, and cannot, make the Q/K/V
+projections commute with lattice rotations, because the input embedding
+itself is not pointwise rotation-covariant.
+
+**Why.** §2.1 anchors `P_{μν}(x)` at one corner of the loop (the
+`μ < ν`, lowest-index corner convention). Under a 90° lattice rotation
+`R`, the loop rotates rigidly but its anchor corner does not map to
+`R · x`.
+
+Concrete 2D example. `P_{01}(x = (0, 1))` is the unit square with corners
+`{(0,1), (1,1), (1,2), (0,2)}`. Rotating by 90° counter-clockwise sends
+these to `{(-1,0), (-1,1), (-2,1), (-2,0)}`. By our anchor-at-the-
+lowest-corner convention this rotated loop is stored at site `(-2, 0)` —
+not at `R · (0, 1) = (-1, 0)`. The plaquette field therefore transforms
+as
+
+```
+(R · P)_{μν}(x)  =  ±  P_{σ(μν)}( R⁻¹x  +  c_{μν} )
+```
+
+with a *channel-dependent* shift `c_{μν}`. No single translation absorbs
+`c` uniformly across channels, so translation equivariance (free from
+weight sharing) cannot rescue point-group equivariance, and orbit-tied
+channel weights alone cannot either.
+
+**Consequence.** Inside one block the channels at site `x` of `R · W^(0)`
+are not simply a permutation of the channels of `W^(0)` at `R⁻¹x`; they
+come from neighboring sites, channel by channel. The block has an
+isotropic *bias prior* but is not exactly point-group equivariant, and
+§7-style stress tests should not be expected to certify rotation
+invariance.
+
+The fix lives at the input embedding, not in the block — store the
+plaquettes at each site as the full set of four site-anchored leaves
+rather than a single anchored channel (§12). Until that is adopted,
+treat point-group symmetry as an inductive prior enforced through
+biases, not as a guarantee.
+
 ---
 
 ## 4. Full network
@@ -436,10 +502,20 @@ charge density (paper 1's 3+1D test): `L = 4`–`6` with `H = 2`, `d = 4`,
 
 ### 4.2 No global average pool
 
-Emit per-site predictions and aggregate downstream only if the target is a
-single global scalar (sum over sites for total topological charge, or for
-the action). Per L-CNN supp. Table XVI, GAP destabilizes training in this
-regime.
+Emit per-site predictions; if the target is a single global scalar, aggregate
+*after* the per-site head. Per L-CNN supp. Table XVI, replacing the per-site
+head with a GAP-then-MLP head destabilizes training, even when the target is
+itself a global scalar.
+
+The downstream aggregation must match the observable's normalization
+(extensive → sum, intensive → mean):
+
+| Target | Per-site head should learn | Downstream aggregation |
+|--------|----------------------------|------------------------|
+| Action `S` | action density | sum over sites |
+| Average plaquette `⟨P⟩` | plaquette / local density | mean over sites |
+| Topological charge `Q` | charge density `q(x)` | sum over sites |
+| Fixed-size Wilson loop | loop value rooted at `x` | mean over sites |
 
 ### 4.3 Optional L-Exp head
 
@@ -458,7 +534,7 @@ review). Re-run Plaq/Poly after each L-Exp.
 - All complex projection weights `w^Q, w^K, w^V`: small Gaussian, scale
   `σ ≈ 0.02 / √C̃`. Real and imaginary parts independent.
 - Channel mix `m`: same.
-- Position bias `b_h(μ, k)`: zero.
+- Position biases `b_h(Δx)` (one per point-group orbit by default; see §3.4): zero.
 - L-Exp `β`: zero (only relevant if L-Exp is used).
 - The combination of (small init) + (residual) means each block starts
   approximately as the identity map (Sec. 3.4), so the network as a whole
@@ -503,7 +579,9 @@ When comparing G-GAT against L-CNN or other real-valued baselines at
 parameters**. The projection weights `w^Q, w^K, w^V ∈ ℂ^{d × C̃}` and the
 channel-mix `m ∈ ℂ^{C_out × H × d}` are complex; failing to double their
 count silently gives G-GAT 2× the capacity of the supposed match. The
-position biases `b_h(μ, k) ∈ ℝ` count as one each.
+position biases `b_h(Δx) ∈ ℝ` count as one *per point-group orbit* under the
+default tying (§3.4); untying them inflates the bias count by the average
+orbit size (typically 8–24 in 4D).
 
 ---
 
@@ -552,7 +630,7 @@ Each G-Attn block produces, at site x, matrices of the form
 i.e. a parallel-transported, attention-weighted bilinear. By the same
 induction as L-CNN's Sec. 3.2 of the Letter:
 
-- One block: with K=R=1 and unit kernels, `Q · Ṽ` produces all 1×k loops up
+- One block: with K=R=1 and unit kernels, `Q† · Ṽ` produces all 1×k loops up
   to k = R, attention-weighted.
 - Stacking L blocks: max loop length doubles each block (Eq. 15 supp.),
   reaching `2^L` after L blocks.
@@ -576,7 +654,7 @@ contribute (the DP folds them transparently). This recovers, per block,
 the non-axis-aligned loop content that L-CNN's axis-aligned L-Conv only
 reaches by stacking, and gives a strictly richer loop *shape* set per
 block than CASK's `s = 1..R` extended staples (which fix one ν direction
-per staple). Loop-doubling per block still holds via the bilinear `Q · Ṽ`
+per staple). Loop-doubling per block still holds via the bilinear `Q† · Ṽ`
 product (Sec. 3.6).
 
 ---
@@ -598,6 +676,9 @@ Replicate L-CNN's benchmarks first to confirm the implementation is sound:
 
 - Lattice `4 × 8³`, train; test up to `8 × 16³`.
 - Target: plaquette discretization (Eq. 13 of review).
+- Prefer flowed/cooled labels for physically meaningful topology; raw
+  plaquette `q(x)` is noisy and can make the model learn discretization
+  artifacts instead of continuum-like topological structure.
 - Combine with Wilson flow at inference; recover near-integer global Q_P.
 
 ### 9.3 Gauge-implementation stress test (trained model)
@@ -613,7 +694,7 @@ Build in this order. Verify each step before moving on.
 
 1. Lattice utilities: roll-with-PBC, dagger, and `build_transport_sums(U, R)`
    — a DP routine that materialises the shortest-path-averaged transport
-   `T_Δx(x)` for every Δx in the positive octant of the L1-ball of radius
+   `T_Δx(x)` for every signed Δx in the L1-ball of radius
    R (Sec. 3.3), in order of increasing `|Δx|_1`. Verify against brute-force
    path enumeration for `|Δx|_1 ≤ 2` (40 offsets in 4D); test the octant
    trick `T_{-Δx}(x) = dagger(T_Δx(x - Δx))` under a random gauge transform.
@@ -622,9 +703,9 @@ Build in this order. Verify each step before moving on.
 3. On-site Q/K/V projection. Test: `Q(T_Ω W̃) = T_Ω Q(W̃)`.
 4. Parallel transport: `Ω_x · K_y · Ω†_y → (Ω_x U_P Ω†_y) · K_y · (Ω_y U†_P Ω†_x)`
    = `Ω_x · (U_P K_y U†_P) · Ω†_x`. Test as a unit.
-5. Score `Re Tr[Q · K̃]`: gauge invariance unit test.
+5. Score `Re Tr[Q† · K̃]`: gauge invariance unit test.
 6. Softmax: numerically stable (subtract max).
-7. Multiplicative value path `α · Q · Ṽ`: covariance unit test.
+7. Multiplicative value path `α · Q† · Ṽ`: covariance unit test.
 8. Channel mix + residual + L-Act: covariance unit test on the full block.
 9. Trace + MLP head: invariance unit test on the full network.
 10. Random + worst-case gauge invariance tests (Sec. 7) on an untrained
@@ -664,18 +745,75 @@ Build in this order. Verify each step before moving on.
   chosen path per offset. Cheaper but breaks the discrete point-group
   symmetry of the transport. Run as an ablation to isolate the
   contribution of path-averaging vs the rest of the architecture.
-- **Tanh score** instead of softmax: sometimes more stable on small lattices.
+- **Path-count-normalized transports**: replace
+  `T_Δx = Σ_P U_P` by `(1 / n_paths(Δx)) Σ_P U_P`, where
+  `n_paths(Δx) = |Δx|_1! / Π_μ |Δx_μ|!`. This removes the systematic norm
+  advantage of mixed-axis offsets while preserving gauge covariance.
+- **Tanh score** instead of softmax: often more natural for additive local
+  observables, and sometimes more stable on small lattices.
+- **Richer invariant L-Act gate**: replace the single-trace gate by a small
+  MLP over local invariants such as `Re Tr W_i`, `Im Tr W_i`, and
+  `Re Tr(W_i W_j)`. This keeps covariance because the gate remains scalar
+  and gauge-invariant, and may help deeper stacks where `Tr W_i` collapses.
 - **Multi-block residual stream à la pre-norm transformer**: separate the
   attention residual from the L-Act residual.
-- **Edge-feature attention**: condition the per-offset bias `b_h(μ, k)` on
-  invariants of the local plaquette as well as `(μ, k)`.
-- **Point-group equivariance** (90° rotations + reflections of the
-  hypercubic lattice). Translation equivariance is automatic from weight
-  sharing; the discrete rotational/reflection group is not. Tie
-  `b_h(Δx)` across the lattice point group's orbits of Δx (e.g. all 8
-  axis-aligned `|Δx|_1 = 1` offsets share one weight; all 24 corner
-  `|Δx|_1 = 2` offsets share one; etc.). Expected to improve MSE on
-  rotation-symmetric targets (Wilson loops, topological charge) at near-
-  zero parameter cost. Cheap to try after Sec. 9.1.
+- **Edge-feature attention**: condition the per-offset bias `b_h(Δx)` on
+  invariants of the local plaquette as well as `Δx` (or its orbit).
+- **Untied point-group biases**: translation equivariance is automatic from
+  weight sharing, but the baseline ties `b_h(Δx)` across point-group orbits.
+  Untie those biases only as an anisotropy ablation or for targets where the
+  lattice axes are physically inequivalent.
+- **Full point-group equivariance via all-leaves input** (preferred over
+  the clover variant below). The default anchored-plaquette embedding
+  (§2.1) is the structural reason the block is gauge- but not point-
+  group-equivariant (§3.10). At each site `x` and each `(μ, ν)` plane,
+  the four 1×1 plaquette loops touching corner `x` carry the regular
+  representation of the local 4-fold rotation: under a 90° rotation in
+  that plane they permute cyclically and stay attached to `x`. Store all
+  four as separate channels of `W^(0)`, each traversed *starting and
+  ending at `x`* so each is independently gauge-covariant at `x` — e.g.
+  ```
+  Q^(1)(x) = U_μ(x)         · U_ν(x+ê_μ)         · U_μ†(x+ê_ν)         · U_ν†(x)
+  Q^(2)(x) = U_ν(x)         · U_μ†(x+ê_ν−ê_μ)    · U_ν†(x−ê_μ)         · U_μ(x−ê_μ)
+  ```
+  (the remaining two go through the `(−μ, −ν)` and `(+μ, −ν)` corners).
+  Each leaf must be rebuilt as a new ordered product from link variables;
+  you *cannot* reuse the neighbor's anchored `P_{μν}(x−ê_μ)` channel,
+  because that matrix is gauge-covariant at `x−ê_μ`, not at `x`. Under
+  rotation, `(R · Q^(i))(x) = Q^(σ(i))(R⁻¹x)`: pointwise channel
+  permutation with no residual shift. Combined with orbit-tied projection
+  and channel-mix weights (every trainable linear map commutes with the
+  channel permutation `σ` induced by `R`) and the already-equivariant
+  transport (§3.3), the entire block becomes exactly hypercubic-
+  equivariant. Cost: 4× input channels per pair (in 4D, `6 → 24`
+  plaquette channels in `W^(0)`); each physical plaquette appears at
+  four sites in four starting orientations, the bookkeeping price of a
+  pointwise group representation. Symmetrization is needed only on the
+  *input*; deeper-layer channels carry only a representation label and
+  inherit equivariance from the orbit-tied linear maps. Verify with the
+  analogue of §7.2: rotate `U`, permute channels by `σ`, check prediction
+  drift stays at machine epsilon.
+
+  *Clover variant.* The Sheikholeslami-Wohlert clover
+  `C_{μν}(x) = Σ_i Q^(i)(x)` (4× cheaper at the input) is the projection
+  of the leaf set onto the trivial irrep of the local rotation. It is
+  the standard improved discretization of the topological charge density
+  `q(x) = (1/32π²) ε_{μνρσ} Tr[F̃_{μν} F̃_{ρσ}]` for exactly that reason,
+  but it discards the three non-trivial irreps the leaves carry. Use the
+  full leaf set unless memory rules it out — orbit-tied weights can
+  *learn* the symmetric sum on their own if the target demands it.
+
+  *Higher D.* Each `(μ, ν)` plane still contributes 4 leaves at each
+  site. The hypercubic group additionally permutes the pair labels
+  `(μ, ν)` themselves, so orbit-tying extends across the joint orbit of
+  `(pair, leaf)` tuples — not just within one pair. Polyakov loops (if
+  used) do not admit a leaf decomposition; tie them across the
+  axis-permutation orbit of the `D+1` direction labels instead.
+
+  *Caveat for anchored-loop targets (§9.1).* The Wilson-loop target
+  `W^(m×n)` is itself anchored at a corner and *not* invariant under the
+  hypercubic group, so no exactly-equivariant model can fit it. Use the
+  anchored baseline of §2.1 for §9.1; reserve the all-leaves (or clover)
+  input for §9.2 and any other rotation-symmetric local-density target.
 
 Defer all of these until Sec. 9.1 passes.

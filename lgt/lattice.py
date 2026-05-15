@@ -59,6 +59,37 @@ class Z2(GaugeGroup):
         return U.conj().transpose(-1, -2)
 
 
+class SU(GaugeGroup):
+    def __init__(self, n: int):
+        self.name = f"SU({n})"
+        self.nc = n
+
+    def random(self, shape, dtype=torch.complex64):
+        # Accept either a real or complex dtype as the precision specifier;
+        # the result is always complex (real dtypes are promoted).
+        complex_dtype = {
+            torch.float32: torch.complex64,
+            torch.float64: torch.complex128,
+            torch.complex64: torch.complex64,
+            torch.complex128: torch.complex128,
+        }[dtype]
+        # Haar sampling on U(N) via QR of a complex Ginibre matrix with the
+        # Mezzadri (2007) diagonal-phase correction: PyTorch's QR fixes the
+        # phase of Q by a convention that is not Haar-uniform, so we absorb
+        # the phases of diag(R) back into Q's columns.
+        z = torch.randn(*shape, self.nc, self.nc, dtype=complex_dtype)
+        q, r = torch.linalg.qr(z)
+        d = torch.diagonal(r, dim1=-2, dim2=-1)
+        q = q * (d / d.abs()).unsqueeze(-2)
+        # q is Haar on U(N), with det on the unit circle; divide by det^(1/nc)
+        # (principal branch) to project onto SU(N).
+        det = torch.linalg.det(q)
+        return q / det.pow(1 / self.nc).unsqueeze(-1).unsqueeze(-1)
+
+    def dagger(self, U):
+        return U.conj().transpose(-1, -2)
+
+
 def random_links(
     L: int,
     D: int,
@@ -218,11 +249,11 @@ def build_transport_sums(
     R: int,
     group: GaugeGroup,
 ) -> Dict[Tuple[int, ...], torch.Tensor]:
-    """Shortest-path-averaged parallel transports for all offsets 0 < |Δx|₁ ≤ R.
+    """Shortest-path-averaged parallel transports for **every** offset 0 < |Δx|₁ ≤ R.
 
-    For each lattice offset Δx the returned tensor ``T_Δx`` has shape
-    ``(*Λ, nc, nc)`` and equals the **unweighted sum over all shortest lattice
-    paths** from x to x+Δx:
+    For each signed lattice offset Δx in the L1-ball of radius R, the returned
+    tensor ``T_Δx`` has shape ``(*Λ, nc, nc)`` and equals the unweighted sum
+    over all shortest lattice paths from x to x+Δx:
 
         T_Δx(x)  =  Σ_{P : x→x+Δx, |P|=|Δx|₁}  U_P
 
@@ -230,69 +261,82 @@ def build_transport_sums(
 
         T_Δx(x)  →  Ω(x) · T_Δx(x) · Ω†(x+Δx)
 
-    Computed via the DP recursion (§3.3 of ``notes/architecture.md``):
+    The DP recursion mixes forward and backward links per component sign:
 
-        T_Δx(x) = Σ_{μ : Δx_μ > 0}  U_μ(x)      · T_{Δx−ê_μ}(x+ê_μ)
-                + Σ_{μ : Δx_μ < 0}  U†_μ(x−ê_μ)  · T_{Δx+ê_μ}(x−ê_μ)
+        T_Δx(x) = Σ_{μ : Δx_μ > 0}  U_μ(x) · T_{Δx − ê_μ}(x + ê_μ)
+                + Σ_{μ : Δx_μ < 0}  U†_μ(x − ê_μ) · T_{Δx + ê_μ}(x − ê_μ)
 
-    Offsets are processed in order of increasing |Δx|₁ so that every
-    sub-step is already in the table when needed.  The zero offset is used
-    as the DP base (identity matrix) and is not included in the output.
+    Sub-offsets ``Δx ∓ ê_μ`` always have strictly smaller L1 norm and the
+    same component signs (just one zeroed out, possibly), so ordering the
+    iteration by ``|Δx|_1`` guarantees every sub-step is in the table when
+    needed.
+
+    The full table covers every offset the G-Attn block iterates over —
+    positive, purely-negative, and mixed-sign — uniformly.  The octant trick
+    ``T_{−Δx}(x) = dagger(T_Δx(x − Δx))`` still holds as a property of the
+    math and is exercised by the test suite, but is not relied on at build
+    time: a single auditable surface for the gauge-implementation stress test
+    (notes/architecture.md §7.2) is worth more than the 2× memory saving for now,
+    later we'll maybe switch to a half table for memory efficiency.
 
     Parameters
     ----------
     U
         Link tensor of shape ``(D, *Λ, nc, nc)``.
     R
-        Manhattan radius; all offsets with ``0 < |Δx|₁ ≤ R`` are computed.
+        Manhattan radius.
     group
-        Gauge group — used for ``dagger`` on backward link steps.
+        Gauge group (used for the backward-link daggers).
 
     Returns
     -------
-    Dict mapping each non-zero offset tuple to a tensor of shape
-    ``(*Λ, nc, nc)``.
+    Dict mapping each signed offset tuple with ``0 < |Δx|₁ ≤ R`` to a tensor
+    of shape ``(*Λ, nc, nc)``.
     """
     D = U.shape[0]
     spatial_shape = U.shape[1:-2]
     nc = U.shape[-1]
 
-    # Identity matrix tiled over the spatial volume — the zero-offset base case.
+    # Identity is the DP base for the zero offset.
     identity = (
         torch.eye(nc, dtype=U.dtype, device=U.device)
         .expand(*spatial_shape, nc, nc)
         .contiguous()
     )
 
+    # Pre-compute U†_μ(x − ê_μ) once per direction: roll by +1 in dim μ brings
+    # the link tensor's value at site x − ê_μ to index x, then dagger.
+    U_back: List[torch.Tensor] = [
+        group.dagger(torch.roll(U[mu], shifts=1, dims=mu)) for mu in range(D)
+    ]
+
     zero: Tuple[int, ...] = (0,) * D
     table: Dict[Tuple[int, ...], torch.Tensor] = {zero: identity}
 
-    for dx in l1_ball_offsets(D, R):
+    # All signed offsets in the L1-ball, sorted by |Δx|_1 so every sub-step is ready.
+    for dx in sorted(
+        (
+            dx
+            for dx in itertools.product(range(-R, R + 1), repeat=D)
+            if 0 < sum(abs(d) for d in dx) <= R
+        ),
+        key=lambda dx: sum(abs(d) for d in dx),
+    ):
         t: Optional[torch.Tensor] = None
         for mu in range(D):
-            if dx[mu] == 0:
-                continue
-            s = 1 if dx[mu] > 0 else -1
-            # One step closer to the origin along axis mu.
-            prev_dx: Tuple[int, ...] = tuple(
-                v - s if i == mu else v for i, v in enumerate(dx)
-            )
-
-            if s > 0:
-                # U_μ(x) · T_{Δx−ê_μ}(x+ê_μ)
-                # roll by -1 in dim mu brings x+ê_μ into position x.
-                link = U[mu]
-                prev = torch.roll(table[prev_dx], shifts=-1, dims=mu)
+            if dx[mu] > 0:
+                prev_dx = tuple(v - 1 if i == mu else v for i, v in enumerate(dx))
+                # U_μ(x) · T_{Δx−ê_μ}(x+ê_μ): roll by −1 brings x+ê_μ to index x.
+                contrib = U[mu] @ torch.roll(table[prev_dx], shifts=-1, dims=mu)
+            elif dx[mu] < 0:
+                prev_dx = tuple(v + 1 if i == mu else v for i, v in enumerate(dx))
+                # U†_μ(x−ê_μ) · T_{Δx+ê_μ}(x−ê_μ): roll by +1 brings x−ê_μ to index x.
+                contrib = U_back[mu] @ torch.roll(table[prev_dx], shifts=1, dims=mu)
             else:
-                # U†_μ(x−ê_μ) · T_{Δx+ê_μ}(x−ê_μ)
-                # roll by +1 in dim mu brings x−ê_μ into position x.
-                link = group.dagger(torch.roll(U[mu], shifts=1, dims=mu))
-                prev = torch.roll(table[prev_dx], shifts=1, dims=mu)
-
-            contrib = link @ prev
+                continue
             t = contrib if t is None else t + contrib
 
-        table[dx] = t  # type: ignore[assignment]  # t is set for every non-zero dx
+        table[dx] = t
 
     del table[zero]
     return table

@@ -61,9 +61,12 @@ L-scan numbers in `scripts/L_scan.py` are still meaningful as a baseline.
 What still does **not** exist (in priority order, per
 `notes/architecture.md` §10 + `notes/roadmap.md` Phase 0):
 
-1. The **G-GAT block** itself, including `build_transport_sums(U, R)` —
-   the DP routine that materialises shortest-path-averaged transports
-   `T_Δx(x)` over the positive octant of the L1-ball (§3.3).
+1. The **G-GAT block** itself. `build_transport_sums(U, R, group)` — the
+   DP routine that materialises shortest-path-averaged transports
+   `T_Δx(x)` over the full signed L1-ball (§3.3) — is implemented and
+   covered by `tests/test_transport.py` (counts, brute force per octant
+   pattern, octant relation, gauge covariance under unitary Ω for both
+   Z₂ and nc=2 complex).
 2. Gauge-implementation stress-test validation (`notes/architecture.md` §7).
 3. Non-Z₂ gauge groups and their production samplers.
 
@@ -147,11 +150,15 @@ Library lives in `lgt/`; entry-point scripts in `scripts/`; pytest in
   on indices (it's harder to vectorise and harder to read).
 - **Wilson action:** `S = β Σ_p (1 − Re Tr P / nc)`. β defaults to 1.0,
   reproducing the legacy unnormalised form `n_plaq − Σ P` for Z₂.
-- **Parallel transport (G-GAT, not yet implemented):** sum over **all**
-  shortest lattice paths in the L1-ball — never a single axis-aligned
-  path. Build via DP on `|Δx|_1`, materialise the positive octant of the
-  L1-ball, derive negatives via the octant trick
-  `T_{-Δx}(x) = dagger(T_Δx(x - Δx))`.
+- **Parallel transport:** sum over **all** shortest lattice paths in the
+  L1-ball — never a single axis-aligned path. `build_transport_sums`
+  materialises the full signed L1-ball in one `|Δx|_1`-ordered DP pass,
+  using `U_μ(x)` for `Δx_μ > 0` steps and `U†_μ(x − ê_μ)` for `Δx_μ < 0`
+  steps. The octant identity `T_{−Δx}(x) = dagger(T_Δx(x − Δx))` holds
+  as a math property and is a test-suite consistency check; it is **not**
+  relied on at build time (a single auditable DP surface is worth more
+  than the 2× memory saving from canonical-offset storage, and mixed-sign
+  offsets cannot be derived from positive-octant data anyway).
   See `notes/architecture.md` §3.3 + §10 step 1.
 - **Float32** for training; pass `dtype=torch.float64` through the
   dataset builders for high-precision gauge-invariance unit tests.
@@ -227,20 +234,16 @@ action regressor on Haar-random data is only memorising the action
 In strict order, per `notes/architecture.md` §10 / `notes/roadmap.md`
 Phase 0:
 
-1. **Lattice utility for G-GAT:** `build_transport_sums(U, R)` — DP over
-   the positive octant of the L1-ball, ordered by `|Δx|_1`. Verify
-   against brute-force path enumeration for `|Δx|_1 ≤ 2`; test the
-   octant trick under a random Ω. (`notes/architecture.md` §10 step 1.)
-2. **G-GAT block.** Build incrementally per the §10 checklist (Plaq /
+1. **G-GAT block.** Build incrementally per the §10 checklist (Plaq /
    Poly / augment / Trace → Q/K/V → transport → score → softmax →
    multiplicative value → channel mix → residual + L-Act), with a
    covariance unit test after each step.
-3. **Gauge-implementation stress test** on the untrained G-GAT before
+2. **Gauge-implementation stress test** on the untrained G-GAT before
    training (`notes/architecture.md` §7) — random Ω + worst-case-Ω
    search via AdamW on `ρ^a_x`. Drift must stay at machine epsilon;
    anything larger is a bug (almost always a missed dagger or a
    non-axis-aligned transport path).
-4. **Replicate Phase 3 (SU(2) Wilson loops + topological charge)** of
+3. **Replicate Phase 3 (SU(2) Wilson loops + topological charge)** of
    `notes/roadmap.md` once the architecture is validated on Z₂. The
    matched-parameter shootout vs. L-CNN at low parameter count and the
    attention-range-vs-correlation-length plot are the thesis's central
