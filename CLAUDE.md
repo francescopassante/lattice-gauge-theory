@@ -1,7 +1,8 @@
-# LGT — Gauge-Equivariant Neural Networks for Lattice Gauge Theory
+# GELT — Gauge-Equivariant Neural Networks for Lattice Gauge Theory
 
 Master's thesis codebase. Goal: build a **gauge-equivariant graph-attention
-network (G-GAT)** for SU(N_c) lattice gauge theory, starting from 2D Z₂ as
+network (or transformer) (GELT - gauge equivariant lattice transformer)**
+for SU(N_c) lattice gauge theory, starting from 2D Z₂ as
 a debug-friendly testbed and scaling toward U(1)/SU(2)/SU(3) and 3+1D.
 
 The architecture follows the L-CNN framework (Favoni et al. 2012.12901)
@@ -21,8 +22,8 @@ All in `notes/`. Read in order before touching the equivariant model:
 - `notes/papers_review.md` — full literature review of L-CNN, the
   gauge-covariant ResNet (Nagai-Tomiya 2103.11965), and CASK (2501.16955).
   Sections 0 (lattice primer) and 1 (L-CNN) are the prerequisites for
-  `architecture.md`. Equation references in `architecture.md` point here.
-- `notes/architecture.md` — implementation spec for the G-GAT block:
+  `architecture.html`. Equation references in `architecture.html` point here.
+- `notes/architecture.html` — implementation spec for the G-GAT block:
   on-site Q/K/V projections, **shortest-path-averaged** parallel
   transport over the L1-ball (§3.3), gauge-invariant attention scores via
   `Re Tr[Q† · K̃]` (physically a two-loop correlator function — §3.4),
@@ -59,7 +60,7 @@ baseline (`LatticeCNN`) is unchanged and trains identically; the saved
 L-scan numbers in `scripts/L_scan.py` are still meaningful as a baseline.
 
 What still does **not** exist (in priority order, per
-`notes/architecture.md` §10 + `notes/roadmap.md` Phase 0):
+`notes/architecture.html` §10 + `notes/roadmap.md` Phase 0):
 
 1. The **G-GAT block** itself. `build_transport_sums(U, R, group)` — the
    DP routine that materialises shortest-path-averaged transports
@@ -67,7 +68,7 @@ What still does **not** exist (in priority order, per
    covered by `tests/test_transport.py` (counts, brute force per octant
    pattern, octant relation, gauge covariance under unitary Ω for both
    Z₂ and nc=2 complex).
-2. Gauge-implementation stress-test validation (`notes/architecture.md` §7).
+2. Gauge-implementation stress-test validation (`notes/architecture.html` §7).
 3. Non-Z₂ gauge groups and their production samplers.
 
 The default dataset path uses the Z₂ Metropolis sampler. Haar-random
@@ -81,10 +82,15 @@ Library lives in `gelt/`; entry-point scripts in `scripts/`; pytest in
 
 ### `gelt/`
 
-- **`lattice.py`** — `GaugeGroup` ABC + `Z2` implementation; pure tensor
-  functions:
+- **`lattice.py`** — `GaugeGroup` ABC with `Z2` and `SU(N)` implementations;
+  pure tensor functions:
   - `random_links(L, D, group, dtype)` → `(D, *Λ, nc, nc)`.
   - `plaquette_tensor(U, group)` → `(D(D-1)/2, *Λ, nc, nc)`.
+  - `augment(W, group)` — expand a covariant field of `C` channels to
+    `2C + 1` by prepending the identity and appending daggers
+    (`[1, W_1, …, W_C, W†_1, …, W†_C]`). Per
+    `notes/architecture.html` §2.3; applied inside the G-Attn block
+    before Q/K/V so the bilinear path can reduce to identity at init.
   - `action(U, group, beta=1.0, plaquettes=None)` → scalar Wilson action
     `β Σ_p (1 − Re Tr P / nc)`.
   - `gauge_transformation(U, omega, group)` — apply site-local Ω to
@@ -93,6 +99,11 @@ Library lives in `gelt/`; entry-point scripts in `scripts/`; pytest in
   - `as_ml_input(U)`, `as_ml_plaquettes(P)` — flatten the trailing color
     axes for ML input. Real groups give `(D · nc², *Λ)`; complex groups
     split real/imag, giving `(2 · D · nc², *Λ)`.
+  - `l1_ball_offsets(D, R)` → list of signed Δx tuples with
+    `1 ≤ |Δx|_1 ≤ R`, ordered by `|Δx|_1`.
+  - `build_transport_sums(U, R, group)` — DP routine that materialises
+    shortest-path-averaged transports `T_Δx(x)` over the full signed
+    L1-ball (`notes/architecture.html` §3.3).
 - **`sampler.py`** — `staple_sum`, `metropolis_sweep` (checkerboard-
   vectorised single-site Metropolis); `mcmc_ensemble` (thermalise +
   decorrelate + collect, dispatches per group via `_SWEEP_FN`);
@@ -126,6 +137,8 @@ Library lives in `gelt/`; entry-point scripts in `scripts/`; pytest in
   3D β-scan (first-order transition), plaquette autocorrelation.
 - **`visualize.py`** — 2D lattice visualisation; takes a link tensor
   directly (not a `Lattice` object — the wrapper class no longer exists).
+- **`timer.py`** — micro-benchmark for `build_transport_sums` on a
+  16⁴ SU(3) configuration (warm-up + repeats, reports mean/median/min).
 
 ### `tests/`
 
@@ -133,6 +146,10 @@ Library lives in `gelt/`; entry-point scripts in `scripts/`; pytest in
   `action` under `gauge_transformation` (bit-exact in Z₂ float64).
 - **`test_data_model.py`** — split-validation and CNN-baseline shape
   guards.
+- **`test_transport.py`** — coverage for `l1_ball_offsets` and
+  `build_transport_sums`: offset counts, brute-force per-octant pattern,
+  octant-relation consistency, and gauge covariance under unitary Ω for
+  both Z₂ and `nc = 2` complex.
 
 ## Conventions
 
@@ -159,10 +176,10 @@ Library lives in `gelt/`; entry-point scripts in `scripts/`; pytest in
   relied on at build time (a single auditable DP surface is worth more
   than the 2× memory saving from canonical-offset storage, and mixed-sign
   offsets cannot be derived from positive-octant data anyway).
-  See `notes/architecture.md` §3.3 + §10 step 1.
+  See `notes/architecture.html` §3.3 + §10 step 1.
 - **Float32** for training; pass `dtype=torch.float64` through the
   dataset builders for high-precision gauge-invariance unit tests.
-  Worst-case-Ω stress tests (`notes/architecture.md` §7.2) should report
+  Worst-case-Ω stress tests (`notes/architecture.html` §7.2) should report
   drift in double precision.
 
 ## Running
@@ -175,6 +192,7 @@ python scripts/L_scan.py              # replay saved L-scan, regenerate R² plot
 python scripts/lr_scan.py             # CNN LR sweep
 python scripts/validate_sampler.py    # Z₂ Metropolis four-panel sanity check
 python scripts/visualize.py           # plot a seeded random 5×5 lattice
+python scripts/timer.py               # micro-benchmark build_transport_sums on 16⁴ SU(3)
 python -m gelt.cnn_baseline           # torchsummary for a 5×5 CNN
 pytest tests                          # unit tests
 ```
@@ -231,7 +249,7 @@ action regressor on Haar-random data is only memorising the action
 
 ## Suggested next steps
 
-In strict order, per `notes/architecture.md` §10 / `notes/roadmap.md`
+In strict order, per `notes/architecture.html` §10 / `notes/roadmap.md`
 Phase 0:
 
 1. **G-GAT block.** Build incrementally per the §10 checklist (Plaq /
@@ -239,7 +257,7 @@ Phase 0:
    multiplicative value → channel mix → residual + L-Act), with a
    covariance unit test after each step.
 2. **Gauge-implementation stress test** on the untrained G-GAT before
-   training (`notes/architecture.md` §7) — random Ω + worst-case-Ω
+   training (`notes/architecture.html` §7) — random Ω + worst-case-Ω
    search via AdamW on `ρ^a_x`. Drift must stay at machine epsilon;
    anything larger is a bug (almost always a missed dagger or a
    non-axis-aligned transport path).

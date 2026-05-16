@@ -45,5 +45,5 @@ def visualize_lattice(U: torch.Tensor, title: str = None):
 if __name__ == "__main__":
     from gelt.lattice import Z2, random_links
 
-    U = random_links(L=5, D=2, group=Z2())
+    U = random_links(L=5, D=2, gaugegroup=Z2())
     visualize_lattice(U)

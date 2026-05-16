@@ -3,10 +3,18 @@
 Run with:  pytest test_lattice.py -v
 """
 
-import torch
 import pytest
+import torch
 
-from gelt.lattice import SU, Z2, augment, random_links, plaquette_tensor, action, gauge_transformation
+from gelt.lattice import (
+    SU,
+    Z2,
+    action,
+    augment,
+    gauge_transformation,
+    plaquette_tensor,
+    random_links,
+)
 
 
 @pytest.fixture
@@ -14,15 +22,16 @@ def z2():
     return Z2()
 
 
-def _random_omega(L: int, D: int, group, dtype, seed: int = 42) -> torch.Tensor:
+def _random_omega(L: int, D: int, gaugegroup, dtype, seed: int = 42) -> torch.Tensor:
     """Sample a random gauge transformation Ω of shape (*Λ, nc, nc)."""
     torch.manual_seed(seed)
-    return group.random((L,) * D, dtype=dtype)
+    return gaugegroup.random((L,) * D, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
 # Z₂ plaquette invariance
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("L,D", [(4, 2), (6, 2), (4, 3)])
 def test_plaquette_bitexact_z2(z2, L, D):
@@ -44,6 +53,7 @@ def test_plaquette_bitexact_z2(z2, L, D):
 # ---------------------------------------------------------------------------
 # Action invariance (general — holds for all unitary groups)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("L,D,beta", [(4, 2, 1.0), (6, 2, 2.5), (4, 3, 0.5)])
 def test_action_invariant_z2(z2, L, D, beta):
@@ -67,6 +77,7 @@ def test_action_invariant_z2(z2, L, D, beta):
 # This is the general identity for any unitary group; for Z₂ it reduces
 # to the bit-exact test above, but the explicit form guards porting to SU(N).
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("L,D", [(4, 2), (6, 2)])
 def test_plaquette_covariance_z2(z2, L, D):
@@ -96,6 +107,7 @@ def test_plaquette_covariance_z2(z2, L, D):
 # ---------------------------------------------------------------------------
 # augment (§2.3): W → [1, W, W†]
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("L,D", [(4, 2), (6, 2), (4, 3)])
 def test_augment_structure_z2(z2, L, D):
@@ -137,6 +149,7 @@ def test_augment_covariance_su2():
 # ---------------------------------------------------------------------------
 # Shape preservation
 # ---------------------------------------------------------------------------
+
 
 def test_output_shape_preserved(z2):
     """gauge_transformation returns a tensor with the same shape as U."""

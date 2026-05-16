@@ -18,7 +18,7 @@ def build_link_datasets(
     N: int,
     D: int,
     L: int,
-    group: GaugeGroup,
+    gaugegroup: GaugeGroup,
     beta: float = 1.0,
     n_therm: int = 200,
     n_skip: int = 5,
@@ -41,13 +41,13 @@ def build_link_datasets(
     if sampler is None:
         sampler = mcmc_ensemble
     configs, _, _ = sampler(
-        L, D, group, beta, N, n_therm=n_therm, n_skip=n_skip, dtype=dtype
+        L, D, gaugegroup, beta, N, n_therm=n_therm, n_skip=n_skip, dtype=dtype
     )
     X = configs if structured else torch.stack([as_ml_input(c) for c in configs])
-    y = torch.stack([action(c, group, beta=beta) for c in configs])
+    y = torch.stack([action(c, gaugegroup, beta=beta) for c in configs])
 
     prefix = _dataset_prefix(
-        group.name.lower(), "link", L, D, N, beta, dtype, structured
+        gaugegroup.name.lower(), "link", L, D, N, beta, dtype, structured
     )
     return _split(X, y, splits, save, prefix=prefix)
 
@@ -56,7 +56,7 @@ def build_plaquette_datasets(
     N: int,
     D: int,
     L: int,
-    group: GaugeGroup,
+    gaugegroup: GaugeGroup,
     beta: float = 1.0,
     n_therm: int = 200,
     n_skip: int = 5,
@@ -79,16 +79,16 @@ def build_plaquette_datasets(
     if sampler is None:
         sampler = mcmc_ensemble
     configs, _, _ = sampler(
-        L, D, group, beta, N, n_therm=n_therm, n_skip=n_skip, dtype=dtype
+        L, D, gaugegroup, beta, N, n_therm=n_therm, n_skip=n_skip, dtype=dtype
     )
-    Ps = torch.stack([plaquette_tensor(c, group) for c in configs])
+    Ps = torch.stack([plaquette_tensor(c, gaugegroup) for c in configs])
     X = Ps if structured else torch.stack([as_ml_plaquettes(p) for p in Ps])
     y = torch.stack(
-        [action(configs[i], group, beta=beta, plaquettes=Ps[i]) for i in range(N)]
+        [action(configs[i], gaugegroup, beta=beta, plaquettes=Ps[i]) for i in range(N)]
     )
 
     prefix = _dataset_prefix(
-        group.name.lower(), "plaquette", L, D, N, beta, dtype, structured
+        gaugegroup.name.lower(), "plaquette", L, D, N, beta, dtype, structured
     )
     return _split(X, y, splits, save, prefix=prefix)
 

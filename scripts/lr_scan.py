@@ -3,8 +3,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from gelt.lattice import Z2
 from gelt.cnn_baseline import LatticeCNN
+from gelt.lattice import Z2
 from gelt.train import full_pipeline
 
 if __name__ == "__main__":
@@ -30,7 +30,7 @@ if __name__ == "__main__":
             D=D,
             N=N,
             model=model,
-            group=Z2(),
+            gaugegroup=Z2(),
             splits=(0.7, 0.15, 0.15),
             lr=float(lr),
             epochs=2000,

@@ -13,8 +13,8 @@ if __name__ == "__main__":
     repeats = 10
 
     def func():
-        U = random_links(group=SU3, L=16, D=4).to("mps")
-        T = build_transport_sums(U, R=4, group=SU3)
+        U = random_links(gaugegroup=SU3, L=16, D=4).to("mps")
+        T = build_transport_sums(U, R=4, gaugegroup=SU3)
 
     for _ in range(warmup):
         func()

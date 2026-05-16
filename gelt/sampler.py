@@ -12,7 +12,7 @@ import torch
 from gelt.lattice import Z2, GaugeGroup, action, plaquette_tensor, random_links
 
 
-def staple_sum(U: torch.Tensor, mu: int, group: GaugeGroup) -> torch.Tensor:
+def staple_sum(U: torch.Tensor, mu: int, gaugegroup: GaugeGroup) -> torch.Tensor:
     """Sum of staples for every site along direction ``mu``.
 
     The local Wilson action for link U_μ(x) is
@@ -27,7 +27,7 @@ def staple_sum(U: torch.Tensor, mu: int, group: GaugeGroup) -> torch.Tensor:
     ----------
     U     : ``(D, *Λ, nc, nc)``
     mu    : direction index
-    group : gauge group (used for ``dagger``)
+    gaugegroup : gauge group (used for ``dagger``)
 
     Returns
     -------
@@ -43,12 +43,12 @@ def staple_sum(U: torch.Tensor, mu: int, group: GaugeGroup) -> torch.Tensor:
         # Forward: U_ν(x+μ̂) · U_μ†(x+ν̂) · U_ν†(x)
         Unu_fwd = torch.roll(Unu, shifts=-1, dims=mu)  # U_ν(x + μ̂)
         Umu_nu = torch.roll(Umu, shifts=-1, dims=nu)  # U_μ(x + ν̂)
-        A = A + Unu_fwd @ group.dagger(Umu_nu) @ group.dagger(Unu)
+        A = A + Unu_fwd @ gaugegroup.dagger(Umu_nu) @ gaugegroup.dagger(Unu)
         # Backward: U_ν†(x+μ̂-ν̂) · U_μ†(x-ν̂) · U_ν(x-ν̂)
         Unu_bwd = torch.roll(torch.roll(Unu, shifts=-1, dims=mu), shifts=+1, dims=nu)
         Umu_negnu = torch.roll(Umu, shifts=+1, dims=nu)  # U_μ(x - ν̂)
         Unu_negnu = torch.roll(Unu, shifts=+1, dims=nu)  # U_ν(x - ν̂)
-        A = A + group.dagger(Unu_bwd) @ group.dagger(Umu_negnu) @ Unu_negnu
+        A = A + gaugegroup.dagger(Unu_bwd) @ gaugegroup.dagger(Umu_negnu) @ Unu_negnu
     return A
 
 
@@ -68,7 +68,7 @@ def _site_parity(spatial_shape: Tuple[int, ...], device: torch.device) -> torch.
 
 def metropolis_sweep(
     U: torch.Tensor,
-    group: GaugeGroup,
+    gaugegroup: GaugeGroup,
     beta: float,
 ) -> Tuple[torch.Tensor, float]:
     """One full Metropolis sweep (all directions, both checkerboard parities).
@@ -84,9 +84,9 @@ def metropolis_sweep(
 
     Parameters
     ----------
-    U         : ``(D, *Λ, nc, nc)`` — not modified in-place
-    group     : gauge group
-    beta      : inverse coupling
+    U          : ``(D, *Λ, nc, nc)`` — not modified in-place
+    gaugegroup : gauge group
+    beta       : inverse coupling
 
     Returns
     -------
@@ -94,7 +94,7 @@ def metropolis_sweep(
     """
     D = U.shape[0]
     spatial_shape = U.shape[1:-2]
-    nc = group.nc
+    nc = gaugegroup.nc
     device = U.device
 
     parity = _site_parity(spatial_shape, device)  # (*Λ)
@@ -105,7 +105,7 @@ def metropolis_sweep(
 
     for mu in range(D):
         for par in (0, 1):
-            A = staple_sum(U, mu, group)  # (*Λ, nc, nc)
+            A = staple_sum(U, mu, gaugegroup)  # (*Λ, nc, nc)
             U_mu = U[mu]
             U_proposed = -U_mu  # Z₂: only proposal is the flip
 
@@ -130,7 +130,7 @@ def metropolis_sweep(
 def haar_ensemble(
     L: int,
     D: int,
-    group: GaugeGroup,
+    gaugegroup: GaugeGroup,
     beta: float,
     n_configs: int,
     n_therm: int = 0,
@@ -145,7 +145,9 @@ def haar_ensemble(
     as ``sampler=haar_ensemble`` anywhere a sampler callable is expected.
     Useful as a baseline or for architecture sanity-checks before MC is set up.
     """
-    configs = torch.stack([random_links(L, D, group, dtype=dtype) for _ in range(n_configs)])
+    configs = torch.stack(
+        [random_links(L, D, gaugegroup, dtype=dtype) for _ in range(n_configs)]
+    )
     return configs, 1.0, []
 
 
@@ -162,7 +164,7 @@ _SWEEP_FN: dict = {
 def mcmc_ensemble(
     L: int,
     D: int,
-    group: GaugeGroup,
+    gaugegroup: GaugeGroup,
     beta: float,
     n_configs: int,
     n_therm: int = 200,
@@ -178,19 +180,19 @@ def mcmc_ensemble(
 
     Parameters
     ----------
-    L, D      : lattice size and number of dimensions
-    group     : gauge group
-    beta      : inverse coupling (Boltzmann weight ~ exp(−β S))
-    n_configs : number of configurations to collect
-    n_therm   : thermalisation sweeps before collection begins
-    n_skip    : sweeps between collected configurations (decorrelation)
-    sweep_fn  : single-sweep callable ``(U, group, beta) → (U_new, acc)``.
-                If ``None``, dispatches automatically via ``_SWEEP_FN[type(group)]``.
-                To pin a custom sweep from a call site that only accepts a sampler
-                argument, use ``functools.partial``::
+    L, D       : lattice size and number of dimensions
+    gaugegroup : gauge group
+    beta       : inverse coupling (Boltzmann weight ~ exp(−β S))
+    n_configs  : number of configurations to collect
+    n_therm    : thermalisation sweeps before collection begins
+    n_skip     : sweeps between collected configurations (decorrelation)
+    sweep_fn   : single-sweep callable ``(U, gaugegroup, beta) → (U_new, acc)``.
+                 If ``None``, dispatches automatically via ``_SWEEP_FN[type(gaugegroup)]``.
+                 To pin a custom sweep from a call site that only accepts a sampler
+                 argument, use ``functools.partial``::
 
-                    sampler = functools.partial(mcmc_ensemble, sweep_fn=my_sweep)
-                    full_pipeline(..., sampler=sampler)
+                     sampler = functools.partial(mcmc_ensemble, sweep_fn=my_sweep)
+                     full_pipeline(..., sampler=sampler)
     dtype, device : passed to ``random_links``
 
     Returns
@@ -201,10 +203,10 @@ def mcmc_ensemble(
         ``action_history`` : action S at every sweep (thermalisation + production)
     """
     if sweep_fn is None:
-        sweep_fn = _SWEEP_FN.get(type(group))
+        sweep_fn = _SWEEP_FN.get(type(gaugegroup))
         if sweep_fn is None:
             raise NotImplementedError(
-                f"No sweep function registered for {type(group).__name__}. "
+                f"No sweep function registered for {type(gaugegroup).__name__}. "
                 f"Pass sweep_fn= explicitly or add an entry to sampler._SWEEP_FN."
             )
 
@@ -216,19 +218,19 @@ def mcmc_ensemble(
         else:
             device = torch.device("cpu")
 
-    U = random_links(L, D, group, dtype=dtype).to(device)
+    U = random_links(L, D, gaugegroup, dtype=dtype).to(device)
 
     action_history = []
 
     for _ in range(n_therm):
-        U, _ = sweep_fn(U, group, beta)
-        action_history.append(action(U, group, beta).cpu().item())
+        U, _ = sweep_fn(U, gaugegroup, beta)
+        action_history.append(action(U, gaugegroup, beta).cpu().item())
 
     configs: List[torch.Tensor] = []
     acc_rates: List[float] = []
     for i in range(n_configs * n_skip):
-        U, acc = sweep_fn(U, group, beta)
-        action_history.append(action(U, group, beta).cpu().item())
+        U, acc = sweep_fn(U, gaugegroup, beta)
+        action_history.append(action(U, gaugegroup, beta).cpu().item())
         if (i + 1) % n_skip == 0:
             configs.append(U.cpu())
             acc_rates.append(acc)

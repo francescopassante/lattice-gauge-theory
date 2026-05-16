@@ -17,6 +17,7 @@ Conventions
 """
 
 import itertools
+import math
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
@@ -93,21 +94,21 @@ class SU(GaugeGroup):
 def random_links(
     L: int,
     D: int,
-    group: GaugeGroup,
+    gaugegroup: GaugeGroup,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Sample a Haar-random link configuration of shape ``(D, L, ..., L, nc, nc)``."""
-    return group.random((D,) + (L,) * D, dtype=dtype)
+    return gaugegroup.random((D,) + (L,) * D, dtype=dtype)
 
 
-def plaquette_tensor(U: torch.Tensor, group: GaugeGroup) -> torch.Tensor:
+def plaquette_tensor(U: torch.Tensor, gaugegroup: GaugeGroup) -> torch.Tensor:
     """Compute every 1×1 plaquette ``P_{μν}(x)`` for ``μ < ν``.
 
     Parameters
     ----------
     U
         Links of shape ``(D, *Λ, nc, nc)`` where ``*Λ`` is the spatial shape.
-    group
+    gaugegroup
         Gauge group (used for the dagger operation).
 
     Returns
@@ -125,12 +126,17 @@ def plaquette_tensor(U: torch.Tensor, group: GaugeGroup) -> torch.Tensor:
         Unu = U[nu]
         Unu_shift_mu = torch.roll(Unu, shifts=-1, dims=mu)  # U_ν(x + μ̂)
         Umu_shift_nu = torch.roll(Umu, shifts=-1, dims=nu)  # U_μ(x + ν̂)
-        P = Umu @ Unu_shift_mu @ group.dagger(Umu_shift_nu) @ group.dagger(Unu)
+        P = (
+            Umu
+            @ Unu_shift_mu
+            @ gaugegroup.dagger(Umu_shift_nu)
+            @ gaugegroup.dagger(Unu)
+        )
         plaqs.append(P)
     return torch.stack(plaqs, dim=0)
 
 
-def augment(W: torch.Tensor, group: GaugeGroup) -> torch.Tensor:
+def augment(W: torch.Tensor, gaugegroup: GaugeGroup) -> torch.Tensor:
     """Expand W-channels to ``2C + 1`` by prepending the identity and appending daggers.
 
         W → [ 1, W_1, …, W_C, W†_1, …, W†_C ]
@@ -145,7 +151,7 @@ def augment(W: torch.Tensor, group: GaugeGroup) -> torch.Tensor:
     ----------
     W
         Covariant field of shape ``(C, *Λ, nc, nc)``.
-    group
+    gaugegroup
         Gauge group (used for the dagger operation).
 
     Returns
@@ -157,12 +163,12 @@ def augment(W: torch.Tensor, group: GaugeGroup) -> torch.Tensor:
     identity = torch.eye(nc, dtype=W.dtype, device=W.device).expand(
         1, *spatial_shape, nc, nc
     )
-    return torch.cat([identity, W, group.dagger(W)], dim=0)
+    return torch.cat([identity, W, gaugegroup.dagger(W)], dim=0)
 
 
 def action(
     U: torch.Tensor,
-    group: GaugeGroup,
+    gaugegroup: GaugeGroup,
     beta: float = 1.0,
     plaquettes: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -172,15 +178,15 @@ def action(
     ----------
     U
         Link tensor (ignored if ``plaquettes`` is provided).
-    group
+    gaugegroup
         Gauge group (used to compute plaquettes if needed).
     beta
         Coupling.
     plaquettes
         Pre-computed plaquette tensor; if ``None`` it is computed from ``U``.
     """
-    P = plaquettes if plaquettes is not None else plaquette_tensor(U, group)
-    re_tr_over_nc = P.diagonal(dim1=-2, dim2=-1).sum(dim=-1).real / group.nc
+    P = plaquettes if plaquettes is not None else plaquette_tensor(U, gaugegroup)
+    re_tr_over_nc = P.diagonal(dim1=-2, dim2=-1).sum(dim=-1).real / gaugegroup.nc
     n_plaq = re_tr_over_nc.numel()
     # equivalent to beta (sum_p 1 - P_p)
     return beta * (n_plaq - re_tr_over_nc.sum())
@@ -219,7 +225,7 @@ def as_ml_plaquettes(P: torch.Tensor) -> torch.Tensor:
 def gauge_transformation(
     U: torch.Tensor,
     omega: torch.Tensor,
-    group: GaugeGroup,
+    gaugegroup: GaugeGroup,
 ) -> torch.Tensor:
     """Apply a site-local gauge transformation Ω to a link configuration.
 
@@ -232,7 +238,7 @@ def gauge_transformation(
         Link tensor of shape ``(D, *Λ, nc, nc)``.
     omega
         Gauge transformation elements of shape ``(*Λ, nc, nc)``.
-    group
+    gaugegroup
         Gauge group (used for the dagger operation).
 
     Returns
@@ -243,7 +249,7 @@ def gauge_transformation(
     out = []
     for mu in range(D):
         omega_shifted = torch.roll(omega, shifts=-1, dims=mu)  # Ω(x + μ̂)
-        out.append(omega @ U[mu] @ group.dagger(omega_shifted))
+        out.append(omega @ U[mu] @ gaugegroup.dagger(omega_shifted))
     return torch.stack(out, dim=0)
 
 
@@ -277,17 +283,19 @@ def l1_ball_offsets(D: int, R: int) -> List[Tuple[int, ...]]:
 def build_transport_sums(
     U: torch.Tensor,
     R: int,
-    group: GaugeGroup,
+    gaugegroup: GaugeGroup,
 ) -> Dict[Tuple[int, ...], torch.Tensor]:
     """Shortest-path-averaged parallel transports for **every** offset 0 < |Δx|₁ ≤ R.
 
     For each signed lattice offset Δx in the L1-ball of radius R, the returned
-    tensor ``T_Δx`` has shape ``(*Λ, nc, nc)`` and equals the unweighted sum
-    over all shortest lattice paths from x to x+Δx:
+    tensor ``T_Δx`` has shape ``(*Λ, nc, nc)`` and equals the **average** over
+    all shortest lattice paths from x to x+Δx:
 
-        T_Δx(x)  =  Σ_{P : x→x+Δx, |P|=|Δx|₁}  U_P
+        T_Δx(x)  =  (1 / N_Δx)  Σ_{P : x→x+Δx, |P|=|Δx|₁}  U_P
 
-    This is gauge-covariant: under site-local Ω,
+    with ``N_Δx = |Δx|₁! / Π_μ |Δx_μ|!`` the multinomial number of shortest
+    paths. The DP builds the unnormalised sum and divides by ``N_Δx`` at the
+    end. Normalising by a scalar preserves gauge covariance: under site-local Ω,
 
         T_Δx(x)  →  Ω(x) · T_Δx(x) · Ω†(x+Δx)
 
@@ -315,7 +323,7 @@ def build_transport_sums(
         Link tensor of shape ``(D, *Λ, nc, nc)``.
     R
         Manhattan radius.
-    group
+    gaugegroup
         Gauge group (used for the backward-link daggers).
 
     Returns
@@ -337,7 +345,7 @@ def build_transport_sums(
     # Pre-compute U†_μ(x − ê_μ) once per direction: roll by +1 in dim μ brings
     # the link tensor's value at site x − ê_μ to index x, then dagger.
     U_back: List[torch.Tensor] = [
-        group.dagger(torch.roll(U[mu], shifts=1, dims=mu)) for mu in range(D)
+        gaugegroup.dagger(torch.roll(U[mu], shifts=1, dims=mu)) for mu in range(D)
     ]
 
     zero: Tuple[int, ...] = (0,) * D
@@ -369,4 +377,16 @@ def build_transport_sums(
         table[dx] = t
 
     del table[zero]
+
+    # Normalise each entry by the number of shortest paths N_Δx.
+    # N_Δx is the multinomial coefficient |Δx|₁! / Π_μ |Δx_μ|!: the |Δx|₁ steps
+    # of the path are partitioned into groups of identical moves (|Δx_μ| moves
+    # in each direction μ). With N_Δx = 1 for the base |Δx|₁ = 1 offsets,
+    # T_{±ê_μ} is left unchanged.
+    for dx in table:
+        n_paths = math.factorial(sum(abs(d) for d in dx))
+        for d in dx:
+            n_paths //= math.factorial(abs(d))
+        if n_paths > 1:
+            table[dx] = table[dx] / n_paths
     return table

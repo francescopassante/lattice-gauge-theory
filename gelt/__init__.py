@@ -1,5 +1,7 @@
+from .cnn_baseline import LatticeCNN
 from .data import build_link_datasets, build_plaquette_datasets
 from .lattice import (
+    SU,
     Z2,
     GaugeGroup,
     action,
@@ -10,5 +12,4 @@ from .lattice import (
     plaquette_tensor,
     random_links,
 )
-from .cnn_baseline import LatticeCNN
 from .sampler import haar_ensemble, mcmc_ensemble

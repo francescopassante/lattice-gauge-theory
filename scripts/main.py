@@ -1,7 +1,7 @@
 import torch
 
-from gelt.lattice import Z2
 from gelt.cnn_baseline import LatticeCNN
+from gelt.lattice import Z2
 from gelt.train import full_pipeline
 
 if __name__ == "__main__":
@@ -18,7 +18,7 @@ if __name__ == "__main__":
         D=D,
         N=N,
         model=model,
-        group=Z2(),
+        gaugegroup=Z2(),
         beta=0.8,
         splits=(0.7, 0.15, 0.15),
         lr=1e-4,

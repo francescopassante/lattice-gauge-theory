@@ -84,7 +84,7 @@ def full_pipeline(
     D: int,
     N: int,
     model: nn.Module,
-    group: GaugeGroup,
+    gaugegroup: GaugeGroup,
     beta: float = 1.0,
     splits: Sequence[float] = (0.7, 0.15, 0.15),
     lr: float = 1e-3,
@@ -103,7 +103,7 @@ def full_pipeline(
     """
     ``sampler`` : ensemble-generator callable with the same interface as
                   ``mcmc_ensemble``.  ``None`` (default) auto-dispatches
-                  to the registered sweep for ``group`` via ``_SWEEP_FN``.
+                  to the registered sweep for ``gaugegroup`` via ``_SWEEP_FN``.
                   Pass ``sampler=haar_ensemble`` for Haar-uniform configurations.
     """
     from gelt.data import build_link_datasets, build_plaquette_datasets
@@ -123,8 +123,16 @@ def full_pipeline(
         else build_link_datasets
     )
     train_dataset, val_dataset, test_dataset = builder(
-        N, D, L, group=group, beta=beta, splits=splits, structured=False,
-        sampler=sampler, n_therm=n_therm, n_skip=n_skip,
+        N,
+        D,
+        L,
+        gaugegroup=gaugegroup,
+        beta=beta,
+        splits=splits,
+        structured=False,
+        sampler=sampler,
+        n_therm=n_therm,
+        n_skip=n_skip,
     )
 
     train_loader = torch.utils.data.DataLoader(
