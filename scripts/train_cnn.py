@@ -119,9 +119,9 @@ if __name__ == "__main__":
     }
 
     train_parameters = {
-        "lr": 1e-4,
-        "epochs": 3000,
-        "patience": 50,
+        "lr": 1e-3,
+        "epochs": 300,
+        "patience": 30,
         "checkpoint_path": "best_model.pth",
         "batch_size": 16,
     }
@@ -133,8 +133,17 @@ if __name__ == "__main__":
     # Derive in_channels from the data so it stays in sync with structured/dtype/group:
     # for SU(N) with structured=False, flatten_color yields 2 · n_pairs · nc² channels.
     in_channels = train_dataset[0][0].shape[0]
+    # Matched-capacity hyperparameters with scripts/train_gelt.py. With
+    # hidden_channels=[1] and fc_hidden=2 the CNN has 1678 numel (all real DOFs).
+    # GELT's matched config is 911 numel ≈ 1707 real DOFs (complex weights
+    # count for 2 real DOFs each). Ratio in real DOFs ≈ 1.02×.
     model = LatticeCNN(
-        L, D, in_channels=in_channels, hidden_channels=[1], kernel_size=3
+        L,
+        D,
+        in_channels=in_channels,
+        hidden_channels=[1],
+        kernel_size=3,
+        fc_hidden=2,
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -165,8 +174,11 @@ if __name__ == "__main__":
 
     X, y = next(iter(train_loader))
     n_params = sum(p.numel() for p in model.parameters())
+    n_real_dofs = sum(
+        p.numel() * (2 if p.is_complex() else 1) for p in model.parameters()
+    )
     print(
-        f"CNN | params: {n_params:,} | "
+        f"CNN | params: {n_params:,} ({n_real_dofs:,} real DOFs) | "
         f"X {tuple(X.shape)} {X.dtype} "
         f"out {model(X).shape}"
     )

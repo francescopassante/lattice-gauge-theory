@@ -131,6 +131,11 @@ if __name__ == "__main__":
         "checkpoint_path": "best_model.pth",
     }
 
+    # Matched-capacity hyperparameters with scripts/train_cnn.py. With
+    # (nhead=2, d_qkv=8, mlp_hidden=16, gemhsa_layers=2) GELT has 911 numel
+    # ≈ 1707 real DOFs (complex Q/K/V/mix weights count for 2 real DOFs each),
+    # comparable to the CNN baseline at hidden_channels=[1], fc_hidden=2
+    # (1678 numel, all real). Ratio in real DOFs ≈ 1.02×.
     model_parameters = {
         "gaugegroup": gaugegroup,
         "L": L,
@@ -138,10 +143,10 @@ if __name__ == "__main__":
         "R": R,
         "nhead": 2,
         "gemhsa_layers": 2,
-        "d_qkv": None,
+        "d_qkv": 8,
         "gate": "softplus",
         "dtype": torch.complex64,
-        "mlp_hidden": 2,
+        "mlp_hidden": 16,
         "mlp_out": 1,
     }
 
@@ -153,7 +158,7 @@ if __name__ == "__main__":
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=train_parameters["lr"])
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10000, gamma=0.5)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -182,26 +187,13 @@ if __name__ == "__main__":
 
     X, T, y = next(iter(train_loader))
     n_params = sum(p.numel() for p in model.parameters())
+    n_real_dofs = sum(
+        p.numel() * (2 if p.is_complex() else 1) for p in model.parameters()
+    )
     print(
-        f"GELT | params: {n_params:,} | "
+        f"GELT | params: {n_params:,} ({n_real_dofs:,} real DOFs) | "
         f"X {tuple(X.shape)} {X.dtype} | T {tuple(T.shape)} {T.dtype} | "
         f"out {tuple(model(X, T).shape)}"
-    )
-
-    # Identity-at-init diagnostic (notes/architecture.html §10): at init the
-    # GEMHSA stack should be a small perturbation of the input. We report
-    # ||attn(W,T) - W||_F / ||W||_F (relative Frobenius drift) and the
-    # untrained val R² so a poor initialization is visible before training.
-    with torch.no_grad():
-        W_attn = model.attn(X, T)
-        drift = (W_attn - X).norm() / X.norm()
-        init_pred = model(X, T)
-        var_y = y.var(unbiased=False).item()
-        init_mse = ((init_pred - y) ** 2).mean().item()
-        init_r2 = 1.0 - init_mse / var_y if var_y > 0 else float("nan")
-    print(
-        f"[init] identity drift ||attn(W,T)-W||/||W|| = {drift.item():.3e} | "
-        f"train-batch MSE = {init_mse:.4f} | Var(y) = {var_y:.4f} | R² = {init_r2:.4f}"
     )
 
     model = model.to(device)

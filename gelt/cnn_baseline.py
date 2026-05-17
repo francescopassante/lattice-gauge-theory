@@ -67,6 +67,7 @@ class LatticeCNN(nn.Module):
         in_channels: int,
         hidden_channels: Sequence[int],
         kernel_size: int = 3,
+        fc_hidden: int = 32,
     ):
         super().__init__()
         if kernel_size <= 0 or kernel_size % 2 == 0:
@@ -83,10 +84,14 @@ class LatticeCNN(nn.Module):
         layers.append(nn.Flatten())
         self.conv = nn.Sequential(*layers)
 
+        # The FC head's hidden width is exposed so the CNN can be tuned to a
+        # comparable parameter budget with GELT — on an L^D lattice the FC
+        # layer at L^D · channels[-1] features dominates the total count,
+        # so this is the natural knob.
         self.fc = nn.Sequential(
-            nn.Linear(self.L**self.D * channels[-1], 32),
+            nn.Linear(self.L**self.D * channels[-1], fc_hidden),
             nn.ReLU(),
-            nn.Linear(32, 1),
+            nn.Linear(fc_hidden, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
