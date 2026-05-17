@@ -105,7 +105,7 @@ if __name__ == "__main__":
     D = 3
     L = 8
     gaugegroup = SU(2)
-    R = 2
+    R = 1
 
     dataset_parameters = {
         "N": 1000,
@@ -125,7 +125,7 @@ if __name__ == "__main__":
 
     train_parameters = {
         "lr": 1e-3,
-        "batch_size": 128,
+        "batch_size": 16,
         "epochs": 300,
         "patience": 30,
         "checkpoint_path": "best_model.pth",
