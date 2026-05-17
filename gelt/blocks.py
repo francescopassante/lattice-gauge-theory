@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from gelt import l1_ball_offsets
+from gelt.lattice import l1_ball_offsets
 
 
 class GEMHSA(nn.Module):
@@ -318,7 +318,7 @@ class GELT(nn.Module):
         d_qkv=None,
         gate="softplus",
         dtype=torch.complex64,
-        mlp_hidden=64,
+        mlp_hidden=32,
         mlp_out=1,
     ):
         # Plaquette input -> D(D-1)/2 plaquettes per site.
@@ -333,8 +333,12 @@ class GELT(nn.Module):
             ]
         )
 
+        # Trace produces real values, so the MLP must live in the matching
+        # real dtype — not the complex `dtype` of the GEMHSA stack. Blanket
+        # `.to(complex_dtype)` on GELT would otherwise miscast the MLP.
+        real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
         self.trace = Trace()
-        self.mlp = MLP(2 * d_input, mlp_hidden, mlp_out)
+        self.mlp = MLP(2 * d_input, mlp_hidden, mlp_out).to(real_dtype)
 
     def attn(self, W, T):
         for layer in self.gemhsa_models:

@@ -3,7 +3,14 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
-from gelt import LatticeCNN, haar_ensemble
+from gelt import haar_ensemble
+from gelt.blocks import GELT
+
+"""
+========================================================================================
+ This is a minimal training script used for lookup on how to train the architecture
+========================================================================================
+"""
 
 
 def evaluate(model, test_loader, criterion, device, save_outputs=False):
@@ -15,15 +22,15 @@ def evaluate(model, test_loader, criterion, device, save_outputs=False):
         all_targets = []
         all_outputs = []
     with torch.no_grad():
-        for inputs, targets in tqdm(test_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            batch_size = targets.shape[0]
+        for X, T, y in tqdm(test_loader):
+            X, T, y = X.to(device), T.to(device), y.to(device)
+            outputs = model(X, T)
+            loss = criterion(outputs, y)
+            batch_size = y.shape[0]
             test_loss += loss.item() * batch_size
             test_count += batch_size
             if save_outputs:
-                all_targets.append(targets.cpu())
+                all_targets.append(y.cpu())
                 all_outputs.append(outputs.cpu())
 
     test_loss /= test_count
@@ -40,9 +47,9 @@ def train_model(
     val_loader,
     criterion,
     optimizer,
+    scheduler,
     device,
     epochs,
-    verbose=True,
     patience=5,
     checkpoint_path: str = "best_model.pth",
 ):
@@ -55,20 +62,20 @@ def train_model(
         model.train()
         train_loss = 0.0
         train_count = 0
-        wrap = tqdm if verbose else (lambda x: x)
-        for inputs, targets in wrap(train_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
+        for X, T, y in tqdm(train_loader):
+            X, T, y = X.to(device), T.to(device), y.to(device)
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            outputs = model(X, T)
+            loss = criterion(outputs, y)
             loss.backward()
             optimizer.step()
-            batch_size = targets.shape[0]
+            batch_size = y.shape[0]
             train_loss += loss.item() * batch_size
             train_count += batch_size
 
         train_loss /= train_count
         train_losses.append(train_loss)
+        scheduler.step()
 
         val_loss = evaluate(model, val_loader, criterion, device)
         val_losses.append(val_loss)
@@ -80,14 +87,12 @@ def train_model(
         else:
             epochs_no_improve += 1
 
-        if verbose:
-            print(
-                f"Epoch {epoch + 1}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}"
-            )
+        print(
+            f"Epoch {epoch + 1}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}"
+        )
 
         if epochs_no_improve >= patience:
-            if verbose:
-                print(f"Early stopping triggered after {epoch + 1} epochs.")
+            print(f"Early stopping triggered after {epoch + 1} epochs.")
             break
 
     return train_losses, val_losses, epoch + 1
@@ -99,16 +104,18 @@ if __name__ == "__main__":
 
     D = 3
     L = 8
+    gaugegroup = SU(2)
+    R = 2
 
     dataset_parameters = {
         "N": 100,
         "D": D,
         "L": L,
-        "gaugegroup": SU(2),
-        "R": None,
+        "gaugegroup": gaugegroup,
+        "R": R,
         "splits": [0.7, 0.15, 0.15],
         "save": True,
-        "structured": False,
+        "structured": True,
         "sampler": haar_ensemble,
         "beta": 1,
         "n_therm": 200,
@@ -117,23 +124,38 @@ if __name__ == "__main__":
     }
 
     train_parameters = {
-        "lr": 1e-4,
-        "epochs": 100,
-        "patience": 10,
-        "checkpoint_path": "best_model.pth",
+        "lr": 1e-2,
         "batch_size": 16,
+        "epochs": 300,
+        "patience": 30,
+        "checkpoint_path": "best_model.pth",
+    }
+
+    model_parameters = {
+        "gaugegroup": gaugegroup,
+        "L": L,
+        "D": D,
+        "R": R,
+        "nhead": 2,
+        "gemhsa_layers": 2,
+        "d_qkv": None,
+        "gate": "softplus",
+        "dtype": torch.complex64,
+        "mlp_hidden": 2,
+        "mlp_out": 1,
     }
 
     train_dataset, val_dataset, test_dataset = build_plaquette_datasets(
         **dataset_parameters
     )
 
-    # Derive in_channels from the data so it stays in sync with structured/dtype/group:
-    # for SU(N) with structured=False, flatten_color yields 2 · n_pairs · nc² channels.
-    in_channels = train_dataset[0][0].shape[0]
-    model = LatticeCNN(
-        L, D, in_channels=in_channels, hidden_channels=[16, 32], kernel_size=3
-    )
+    model = GELT(**model_parameters)
+
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=train_parameters["lr"])
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=train_parameters["batch_size"], shuffle=True
@@ -145,16 +167,15 @@ if __name__ == "__main__":
         test_dataset, batch_size=train_parameters["batch_size"], shuffle=False
     )
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
+    X, T, y = next(iter(train_loader))
+    n_params = sum(p.numel() for p in model.parameters())
+    print(
+        f"GELT | params: {n_params:,} | "
+        f"X {tuple(X.shape)} {X.dtype} | T {tuple(T.shape)} {T.dtype} | "
+        f"out {tuple(model(X, T).shape)}"
     )
+
     model = model.to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=train_parameters["lr"])
 
     train_losses, val_losses, full_epochs = train_model(
         model=model,
@@ -162,6 +183,7 @@ if __name__ == "__main__":
         val_loader=val_loader,
         criterion=criterion,
         optimizer=optimizer,
+        scheduler=scheduler,
         device=device,
         epochs=train_parameters["epochs"],
         patience=train_parameters["patience"],

@@ -1,3 +1,4 @@
+from .blocks import GELT
 from .cnn_baseline import LatticeCNN
 from .data import build_plaquette_datasets
 from .lattice import (
