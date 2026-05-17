@@ -131,6 +131,14 @@ class GEMHSA(nn.Module):
             (self.C, self.H, self.d_qkv), sigma_mix, dtype
         )
 
+        # ReZero / LayerScale: per-block learnable scalar α, init to 0 so the
+        # block is *exactly* identity at init regardless of gate choice (the
+        # gate g_softplus(0) = ln 2 ≠ 1 would otherwise rescale W on the first
+        # forward, breaking the §5 "identity-at-init" property). α is real and
+        # gauge-invariant; the convex combination of two equivariant terms
+        # remains equivariant. See notes/architecture.html §3.8.
+        self.alpha = nn.Parameter(torch.zeros(1))
+
     @staticmethod
     def _init_projection(shape, sigma, dtype):
         """Small-Gaussian init for a complex (or real) projection weight.
@@ -264,7 +272,11 @@ class GEMHSA(nn.Module):
             g = F.relu(trace_per_chan)
         else:
             g = F.softplus(trace_per_chan)
-        return g.unsqueeze(-1).unsqueeze(-1) * W_res
+        W_act = g.unsqueeze(-1).unsqueeze(-1) * W_res
+        # ReZero: blend toward the L-Act output with a per-block scalar α
+        # (zero-init). At α=0 the block is bit-exactly the identity W → W;
+        # during training α grows and the gate/mix path takes over.
+        return W + self.alpha * (W_act - W)
 
 
 class Trace(nn.Module):

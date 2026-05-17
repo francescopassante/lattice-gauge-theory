@@ -323,7 +323,7 @@ V_{x,h,a} = Σ_j w^V_{h,a,j} · W̃_{x,j}</code></pre>
     <pre><code>s_{x→y,h}  +=  b_h(Δx)        (real, trainable)</code></pre>
     <p>Tie <code>b_h</code> across the lattice point-group's orbit of <code>Δx</code> (90° rotations + parity) by default for isotropic targets (Wilson loops, action, topological charge). Untie only when the physics distinguishes axes (e.g. finite temperature).</p>
 
-    <p><strong>Identity at init.</strong> Combined with small <code>w^V</code> (§5) and the residual (§3.8), the block as a whole reduces to identity at init: <code>w^V → 0</code> kills the value path, so <code>W_in + 0 = W_in</code>. The score value at init is irrelevant — softmax of near-zero invariants is approximately uniform, multiplied into a near-zero value sum it stays near zero. No score-reference subtraction is needed.</p>
+    <p><strong>Identity at init.</strong> The ReZero scalar <code>α</code> (§3.8) is zero-initialized, so the block returns <code>W^{(in)}</code> bit-exactly at init regardless of what the value path / score / gate produce. Small <code>w^V, w^{mix}</code> still matter as a warm-start for the post-ReZero regime (they keep the gradient through <code>α</code> on a sane scale once <code>α</code> ramps up), and the score being approximately uniform at init means the early attention pattern is isotropic. No score-reference subtraction is needed.</p>
 
     <p><strong>Physical interpretation.</strong> Substituting the transport rule into the score gives, schematically:</p>
     <pre><code>s_{x→y,h,a} ∝ Re Tr [ Q†_{x,h,a} · T_Δx(x) · K_{y,h,a} · T†_Δx(x) ]</code></pre>
@@ -344,13 +344,16 @@ V_{x,h,a} = Σ_j w^V_{h,a,j} · W̃_{x,j}</code></pre>
     <p><code>W^{(out)}</code> has <code>H·d</code> channels. Mix to <code>C_out</code> via a trainable complex map (no transport, on-site):</p>
     <pre><code>W^{(out,mixed)}_{x,i}  =  Σ_{h,a}  m_{i,h,a} · W^{(out)}_{x,h,a}      m ∈ ℂ</code></pre>
 
-    <h3 id="s3-8">3.8 Residual + L-Act</h3>
+    <h3 id="s3-8">3.8 Residual + L-Act (ReZero)</h3>
     <pre><code>W^{(res)}_{x,i} = W^{(in)}_{x,i} + W^{(out,mixed)}_{x,i}
-W^{(act)}_{x,i} = g_{x,i}(U, W^{(res)}) · W^{(res)}_{x,i}</code></pre>
+W^{(act)}_{x,i} = g_{x,i}(U, W^{(res)}) · W^{(res)}_{x,i}
+W^{(block)}_{x,i} = W^{(in)}_{x,i} + α · ( W^{(act)}_{x,i} − W^{(in)}_{x,i} )</code></pre>
     <p>Multiplication by an invariant scalar preserves covariance. Two viable gates:</p>
     <pre><code>g_relu(W)     = ReLU( Re Tr[W] / N_c )         # L-CNN default
 g_softplus(W) = softplus( Re Tr[W] / N_c )      # never vanishes</code></pre>
-    <p><strong>Caveat for SU(N), N &gt; 1.</strong> <code>Tr[W]</code> projects out the traceless part; products of plaquettes can be approximately traceless after a few blocks, in which case ReLU kills the channel. Prefer <code>g_softplus</code> beyond 2–3 blocks, or use <code>ReLU(Re Tr[W]/N_c + b₀)</code> with small positive <code>b₀</code>. The residual + small init makes each block start as identity, enabling stable deep stacking.</p>
+    <p><strong>Caveat for SU(N), N &gt; 1.</strong> <code>Tr[W]</code> projects out the traceless part; products of plaquettes can be approximately traceless after a few blocks, in which case ReLU kills the channel. Prefer <code>g_softplus</code> beyond 2–3 blocks, or use <code>ReLU(Re Tr[W]/N_c + b₀)</code> with small positive <code>b₀</code>.</p>
+    <p><strong>Why ReZero and not just residual + L-Act.</strong> A naïve residual <code>W^{(act)} = g(W^{(res)}) · W^{(res)}</code> is <em>not</em> identity at init: with small <code>w^V, w^{mix}</code> we have <code>W^{(res)} ≈ W^{(in)}</code>, but the gate then rescales by <code>g(W^{(in)})</code>. For <code>g_softplus</code> and the natural input regime (<code>Re Tr[W]/N_c ≈ 0</code> on Haar-random or near-Haar configs), <code>g ≈ softplus(0) = ln 2 ≈ 0.693</code>, so each block multiplies <code>W</code> by ~0.7 — an exponential decay with depth that kills the deep-stack stability the residual was supposed to give. Empirically the L-Frobenius drift <code>‖attn(W,T) − W‖ / ‖W‖</code> is ≈ 0.56 after two GEMHSA blocks on SU(2) Haar plaquettes with <code>g_softplus</code>, far from identity.</p>
+    <p>The fix is the standard ReZero / LayerScale trick: introduce one learnable real scalar <code>α</code> per block, zero-initialized, and blend <code>W^{(block)} = W^{(in)} + α · (W^{(act)} − W^{(in)})</code>. At init <code>α = 0</code> so the block is <em>bit-exactly</em> the identity, regardless of gate choice or input scale; during training <code>α</code> grows and the gate/mix path takes over. <code>α</code> is gauge-invariant by construction (a real scalar), so the convex combination of two equivariant terms remains equivariant — the §7 stress test is unaffected. This is what makes the §5 "identity at init" property hold literally, not merely up to a global multiplicative factor, and is what enables stable deep stacking.</p>
 
     <h3 id="s3-9">3.9 Pseudocode</h3>
     <pre><code>def G_Attn_block(U, W_in, weights):
@@ -387,10 +390,11 @@ g_softplus(W) = softplus( Re Tr[W] / N_c )      # never vanishes</code></pre>
     # 3.7 channel mix
     W_mix = einsum("iha,bhaxmn-&gt;bixmn", weights.mix, W_out_hd)
 
-    # 3.8 residual + L-Act
+    # 3.8 residual + L-Act + ReZero
     W_res = W_in + W_mix
-    gate  = relu(real(trace(W_res, axes=(-2,-1))) / Nc)
-    return gate[..., None, None] * W_res</code></pre>
+    gate  = softplus(real(trace(W_res, axes=(-2,-1))) / Nc)
+    W_act = gate[..., None, None] * W_res
+    return W_in + weights.alpha * (W_act - W_in)   # alpha: real scalar, init 0</code></pre>
 
     <h3 id="s3-10">3.10 Scope: gauge but not point-group equivariance</h3>
     <p>Every layer is exactly gauge-equivariant. The block as a whole is <strong>not</strong> exactly point-group equivariant, even with orbit-tied biases (§3.4). The biases make the offset attention pattern an isotropic prior; they cannot make Q/K/V projections commute with lattice rotations, because the input embedding itself is not pointwise rotation-covariant.</p>
@@ -432,7 +436,8 @@ g_softplus(W) = softplus( Re Tr[W] / N_c )      # never vanishes</code></pre>
       <li>Complex projections <code>w^Q, w^K, w^V</code> and channel mix <code>m</code>: small Gaussian, <code>σ ≈ 0.02 / √C̃</code>. Real and imaginary parts independent.</li>
       <li>Position biases <code>b_h(Δx)</code> (one per orbit): zero.</li>
       <li>L-Exp <code>β</code>: zero.</li>
-      <li>Small init + residual ⇒ each block ≈ identity at init; the network is equivalent to <code>W^(0)</code> piped straight to Trace. Attention pattern is approximately uniform. <strong>Verify empirically before training.</strong></li>
+      <li><strong>ReZero scalar <code>α</code> (§3.8): zero.</strong> This is what makes the identity property hold bit-exactly; small-σ projections alone are insufficient because the gate <code>g_softplus(0) = ln 2 ≠ 1</code> rescales <code>W</code> on every forward.</li>
+      <li>With <code>α = 0</code> each block returns <code>W^{(in)}</code> verbatim, so the network is equivalent to <code>W^{(0)}</code> piped straight to Trace. Attention pattern is irrelevant at init (any <code>α</code>-scaled artifact is zeroed out). <strong>Verify empirically before training</strong> (drift <code>‖attn(W,T) − W‖ / ‖W‖</code> should be at machine ε).</li>
     </ul>
 
     <hr />
