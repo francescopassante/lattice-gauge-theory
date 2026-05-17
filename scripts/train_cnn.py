@@ -97,13 +97,13 @@ def train_model(
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    from gelt import SU, build_plaquette_datasets
+    from gelt import SU, Z2, build_plaquette_datasets
 
     D = 3
     L = 8
 
     dataset_parameters = {
-        "N": 100,
+        "N": 1000,
         "D": D,
         "L": L,
         "gaugegroup": SU(2),
@@ -165,12 +165,6 @@ if __name__ == "__main__":
     sigma_y = y_train.std(unbiased=False).clamp_min(1e-12)
     train_dataset.dataset.tensors[-1].sub_(mu_y).div_(sigma_y)
     print(f"target scaler fit: μ_y = {mu_y.item():.4f} | σ_y = {sigma_y.item():.4f}")
-
-    # Zero-init the last linear layer of the CNN head so the untrained model
-    # outputs exactly 0 (constant predictor at the normalized mean → R² = 0).
-    # Matches the zero-init pairing used inside GELT (gelt/blocks.py).
-    nn.init.zeros_(model.fc[-1].weight)
-    nn.init.zeros_(model.fc[-1].bias)
 
     X, y = next(iter(train_loader))
     n_params = sum(p.numel() for p in model.parameters())

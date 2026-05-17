@@ -108,7 +108,7 @@ if __name__ == "__main__":
     R = 2
 
     dataset_parameters = {
-        "N": 100,
+        "N": 1000,
         "D": D,
         "L": L,
         "gaugegroup": gaugegroup,
