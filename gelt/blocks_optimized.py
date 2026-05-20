@@ -270,8 +270,10 @@ class GEMHSA(nn.Module):
         w_W = w_QKV[:, :, 1 : self.C + 1]
         w_W_dag = w_QKV[:, :, self.C + 1 :]
         
-        # (3, H*d, C) @ (B, C, N*nc*nc) -> (3, B, H*d, N*nc*nc)
-        QKV_W = torch.matmul(w_W, W_flat) + torch.matmul(w_W_dag, W_dag_flat)
+        # We need to broadcast the 3 (Q,K,V) over the Batch dimension B.
+        # w_W: (3, 1, H*d, C), W_flat: (1, B, C, N) -> (3, B, H*d, N)
+        QKV_W = torch.matmul(w_W.unsqueeze(1), W_flat.unsqueeze(0)) + \
+                torch.matmul(w_W_dag.unsqueeze(1), W_dag_flat.unsqueeze(0))
         QKV_W = QKV_W.view(3, B, self.H, self.d_qkv, *trailing)
         
         QKV = QKV + QKV_W # (3, B, H, d_qkv, *Λ, nc, nc)
