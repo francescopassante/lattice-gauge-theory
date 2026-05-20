@@ -45,18 +45,28 @@ def _plaq_stats(configs):
 print("1/4  Thermalization histories …")
 therm: dict = {}
 for beta in [0.2, 0.5, 0.8, 1.2]:
-    _, _, hist = mcmc_ensemble(
-        L=8, D=2, gaugegroup=gaugegroup, beta=beta, n_configs=1, n_therm=400, n_skip=1
+    configs, _ = mcmc_ensemble(
+        L=8,
+        D=2,
+        gaugegroup=gaugegroup,
+        beta=beta,
+        n_configs=400,
+        n_therm=0,
+        n_skip=1,
     )
-    n_plaq = 8**2
-    therm[beta] = np.array([1.0 - s / (beta * n_plaq) for s in hist])
+    therm[beta] = np.array(
+        [
+            (_re_tr(plaquette_tensor(c, gaugegroup)).mean() / gaugegroup.nc).item()
+            for c in configs
+        ]
+    )
 
 # ── 2/4  2D β-scan ────────────────────────────────────────────────────────────
 print("2/4  2D β-scan …")
 scan2: dict = {L: ([], []) for L in LS_2D}
 for L in LS_2D:
     for b in BETAS_2D:
-        cfgs, _, _ = mcmc_ensemble(
+        cfgs, _ = mcmc_ensemble(
             L=L,
             D=2,
             gaugegroup=gaugegroup,
@@ -75,7 +85,7 @@ print("3/4  3D β-scan …")
 scan3: dict = {L: ([], []) for L in LS_3D}
 for L in LS_3D:
     for b in BETAS_3D:
-        cfgs, _, _ = mcmc_ensemble(
+        cfgs, _ = mcmc_ensemble(
             L=L,
             D=3,
             gaugegroup=gaugegroup,
@@ -97,7 +107,7 @@ print("4/4  Autocorrelation …")
 AC_BETA = 0.8
 N_AC = 1000
 MAX_LAG = 50
-_, _, full_hist = mcmc_ensemble(
+configs_ac, _ = mcmc_ensemble(
     L=8,
     D=2,
     gaugegroup=gaugegroup,
@@ -106,9 +116,12 @@ _, _, full_hist = mcmc_ensemble(
     n_therm=200,
     n_skip=1,
 )
-n_plaq_ac = 8**2
-# production part only (drop the 200-sweep thermalisation prefix)
-plaq_ts = np.array([1.0 - s / (AC_BETA * n_plaq_ac) for s in full_hist[200:]])
+plaq_ts = np.array(
+    [
+        (_re_tr(plaquette_tensor(c, gaugegroup)).mean() / gaugegroup.nc).item()
+        for c in configs_ac
+    ]
+)
 delta = plaq_ts - plaq_ts.mean()
 var = np.mean(delta**2)
 C_ac = np.array(

@@ -84,7 +84,7 @@ def build_plaquette_datasets(
     once per link config (from which the plaquettes were derived) and stored
     alongside ``X`` and ``y``.  See :func:`build_link_datasets` for details.
     """
-    configs, _, _ = sampler(
+    configs, _ = sampler(
         L, D, gaugegroup, beta, N, n_therm=n_therm, n_skip=n_skip, dtype=dtype
     )
     Ps = torch.stack([plaquette_tensor(c, gaugegroup) for c in configs])

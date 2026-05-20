@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from gelt.lattice import Z2, GaugeGroup, action, random_links
+from gelt.lattice import Z2, GaugeGroup, random_links
 
 
 def staple_sum(U: torch.Tensor, mu: int, gaugegroup: GaugeGroup) -> torch.Tensor:
@@ -136,7 +136,7 @@ def haar_ensemble(
     sweep_fn=None,
     dtype: torch.dtype = torch.float32,
     device: Optional[torch.device] = None,
-) -> Tuple[torch.Tensor, float, List[float]]:
+) -> Tuple[torch.Tensor, float]:
     """Haar-uniform ensemble — no dynamics, ignores beta.
 
     Shares the sampler interface with ``mcmc_ensemble`` so it can be passed
@@ -146,7 +146,7 @@ def haar_ensemble(
     configs = torch.stack(
         [random_links(L, D, gaugegroup, dtype=dtype) for _ in range(n_configs)]
     )
-    return configs, 1.0, []
+    return configs, 1.0
 
 
 # Registry: maps GaugeGroup subclass → default sweep function.
@@ -170,7 +170,7 @@ def mcmc_ensemble(
     sweep_fn=None,
     dtype: torch.dtype = torch.float32,
     device: Optional[torch.device] = None,
-) -> Tuple[torch.Tensor, float, List[float]]:
+) -> Tuple[torch.Tensor, float]:
     """Generate a thermalized ensemble of gauge field configurations.
 
     Starts from a Haar-random configuration, runs ``n_therm`` thermalisation
@@ -195,10 +195,9 @@ def mcmc_ensemble(
 
     Returns
     -------
-    (configs, mean_acceptance, action_history)
+    (configs, mean_acceptance)
         ``configs``        : ``(n_configs, D, *Λ, nc, nc)`` on CPU
         ``mean_acceptance``: mean acceptance rate over production run
-        ``action_history`` : action S at every sweep (thermalisation + production)
     """
     if sweep_fn is None:
         sweep_fn = _SWEEP_FN.get(type(gaugegroup))
@@ -218,19 +217,15 @@ def mcmc_ensemble(
 
     U = random_links(L, D, gaugegroup, dtype=dtype).to(device)
 
-    action_history = []
-
     for _ in range(n_therm):
         U, _ = sweep_fn(U, gaugegroup, beta)
-        action_history.append(action(U, gaugegroup, beta).cpu().item())
 
     configs: List[torch.Tensor] = []
     acc_rates: List[float] = []
     for i in range(n_configs * n_skip):
         U, acc = sweep_fn(U, gaugegroup, beta)
-        action_history.append(action(U, gaugegroup, beta).cpu().item())
         if (i + 1) % n_skip == 0:
             configs.append(U.cpu())
             acc_rates.append(acc)
 
-    return torch.stack(configs), sum(acc_rates) / len(acc_rates), action_history
+    return torch.stack(configs), sum(acc_rates) / len(acc_rates)
