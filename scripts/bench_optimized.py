@@ -87,7 +87,7 @@ def main():
     gaugegroup = SU(2)
 
     dataset_parameters = {
-        "N": 1000, # Increased for better V100 throughput
+        "N": 100,
         "D": D,
         "L": L,
         "gaugegroup": gaugegroup,
