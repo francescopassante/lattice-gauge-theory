@@ -1,48 +1,11 @@
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from gelt.lattice import l1_ball_offsets
 
-
 class GEMHSA(nn.Module):
-    """Gauge-equivariant multi-head self-attention block (G-Attn).
-
-    The input is a batched covariant W-field of shape ``(B, C, *Λ, nc, nc)`` and the output has the
-    same shape, so blocks chain. Every channel of W transforms in the
-    adjoint representation, ``W → Ω W Ω†``.
-
-    Pipeline (one G-Attn block):
-
-    1. **augment + project.** Append the on-site identity and daggers
-    (``C → C̃ = 2C + 1``), then project to per-head Q, K, V of
-       shape ``(B, H, d_qkv, *Λ, nc, nc)``.
-    2. **adjoint transport.** For every Δx in the L1-ball, gather
-       the neighbour fields ``K(x+Δx)`` / ``V(x+Δx)`` and apply the
-       shortest-path-averaged transport in the adjoint representation:
-       ``Kprime = T(x) · K(x+Δx) · T†(x)``.
-    3. **score.** ``s = (1/√(nc·d)) · Re Σ_a Tr[Q†_a · K̃_a]`` per offset
-       and per head, plus a learnable real bias tied across the lattice
-       point-group orbit of Δx (sign flips + axis permutations).
-    4. **softmax** over the offset axis (normalizes over neighbours per
-       site, per head).
-    5. **multiplicative value path.** Output of the attention head is
-       ``Σ_i α_i · Q†(x) · Ṽ_i(x)`` — both factors are covariant at x, so the
-       product is covariant; this is the L-Bilin-baked-in step that gives the
-       loop-doubling expressivity argument.
-    6. **channel mix back to C** via a complex linear ``(H, d_qkv) → C``.
-    7. **residual + L-Act gate.** ``W_act = g(W_res) · W_res`` with
-       ``W_res = W_in + W_mix`` and ``g(W) = ReLU(Re Tr[W]/nc)`` (default)
-       or ``softplus(Re Tr[W]/nc)``.
-
-    The transport ``T`` is precomputed by the dataset builder (it is a
-    function of the link configuration only, see
-    :func:`gelt.lattice.build_transport_sums`). ``forward(W, T)`` takes it as
-    a tensor of shape ``(B, n_offsets, *Λ, nc, nc)``
-    """
-
     def __init__(
         self,
         gaugegroup,
@@ -62,91 +25,42 @@ class GEMHSA(nn.Module):
         self.H = nhead
         self.C = d_input
         self.d_qkv = d_input // nhead if d_qkv is None else d_qkv
-        if self.d_qkv < 1:
-            raise ValueError(
-                f"d_qkv must be >= 1, got {self.d_qkv} "
-                f"(d_input={d_input}, nhead={nhead}). "
-                f"Pass d_qkv explicitly when d_input < nhead — this happens "
-                f"e.g. with GELT in D=2, where d_input = D(D-1)/2 = 1."
-            )
+        
         if gate not in ("relu", "softplus"):
             raise ValueError(f"gate must be 'relu' or 'softplus', got {gate!r}")
         self.gate = gate
 
-        # offsets is a list of the Δx_i in the L1 ball of radius R
         self.offsets = l1_ball_offsets(D, R)
         self.n_offsets = len(self.offsets)
 
-        # _nbr_idx[d, i, x] are the coords of the neighbor of x at offset Δx_i
-        # = (x[d] + Δx_i[d]) mod L.
-        offset_tensor = torch.tensor(self.offsets, dtype=torch.long)  # (n_off, D)
-        coords = torch.meshgrid(
-            *[torch.arange(L) for _ in range(D)], indexing="ij"
-        )  # (*Λ)
-        nbr_idx = torch.stack(
-            [
-                (coords[d].unsqueeze(0) + offset_tensor[:, d].view(-1, *([1] * D))) % L
-                for d in range(D)
-            ],
-            dim=0,
-        )  # (D, n_offsets, *Λ)
+        offset_tensor = torch.tensor(self.offsets, dtype=torch.long)
+        coords = torch.meshgrid(*[torch.arange(L) for _ in range(D)], indexing="ij")
+        nbr_idx = torch.stack([
+            (coords[d].unsqueeze(0) + offset_tensor[:, d].view(-1, *([1] * D))) % L
+            for d in range(D)
+        ], dim=0)
         self.register_buffer("_nbr_idx", nbr_idx)
 
-        # Orbit-tied score bias. Offsets in the same point-group orbit
-        # (sign flips + axis permutations) share a single learnable scalar
-        # per head. Sigs are essentially the offsets in the positive octant,
-        # all the other bias are tied to these by symmetry.
-        sigs = [
-            tuple(sorted((abs(d) for d in dx), reverse=True)) for dx in self.offsets
-        ]
+        sigs = [tuple(sorted((abs(d) for d in dx), reverse=True)) for dx in self.offsets]
         unique_sigs = sorted(set(sigs))
         sig_to_idx = {s: i for i, s in enumerate(unique_sigs)}
-        # n_orbits = number of unique biases
         self.n_orbits = len(unique_sigs)
-        # orbit_idx = indices of sigs, where two sigs that are symmetry-tied have the same index (n_sigs)
         orbit_idx = torch.tensor([sig_to_idx[s] for s in sigs], dtype=torch.long)
-        self.register_buffer("_orbit_idx", orbit_idx)  # (n_offsets,)
+        self.register_buffer("_orbit_idx", orbit_idx)
         self.b_h = nn.Parameter(torch.zeros(self.H, self.n_orbits))
 
-        # Channel augmentation expands
-        # C -> Ctilde = 2C + 1 by prepending the identity and appending daggers.
         self.C_tilde = 2 * d_input + 1
-
-        # Small Gaussian init with σ ≈ 0.02 / √Ctilde, real and imaginary
-        # parts independent. Together with the residual + small w^V this
-        # makes the block ≈ identity at init.
         sigma = 0.02 / math.sqrt(self.C_tilde)
-        self.w_Q = self._init_projection(
-            (self.H, self.d_qkv, self.C_tilde), sigma, dtype
-        )
-        self.w_K = self._init_projection(
-            (self.H, self.d_qkv, self.C_tilde), sigma, dtype
-        )
-        self.w_V = self._init_projection(
-            (self.H, self.d_qkv, self.C_tilde), sigma, dtype
-        )
-        # channel mix back to C output channels.
+        self.w_Q = self._init_projection((self.H, self.d_qkv, self.C_tilde), sigma, dtype)
+        self.w_K = self._init_projection((self.H, self.d_qkv, self.C_tilde), sigma, dtype)
+        self.w_V = self._init_projection((self.H, self.d_qkv, self.C_tilde), sigma, dtype)
+        
         sigma_mix = 0.02 / math.sqrt(self.H * self.d_qkv)
-        self.w_mix = self._init_projection(
-            (self.C, self.H, self.d_qkv), sigma_mix, dtype
-        )
-
-        # ReZero / LayerScale: per-block learnable scalar α, init to 0 so the
-        # block is *exactly* identity at init regardless of gate choice (the
-        # gate g_softplus(0) = ln 2 ≠ 1 would otherwise rescale W on the first
-        # forward, breaking the §5 "identity-at-init" property). α is real and
-        # gauge-invariant; the convex combination of two equivariant terms
-        # remains equivariant. See notes/architecture.html §3.8.
+        self.w_mix = self._init_projection((self.C, self.H, self.d_qkv), sigma_mix, dtype)
         self.alpha = nn.Parameter(torch.zeros(1))
 
     @staticmethod
     def _init_projection(shape, sigma, dtype):
-        """Small-Gaussian init for a complex (or real) projection weight.
-
-        For complex ``dtype`` we draw real and imaginary parts independently
-        from ``N(0, σ²)`` — using ``torch.randn(..., dtype=complex)`` would
-        give each part variance ``σ²/2``, halving the spec's std.
-        """
         if dtype.is_complex:
             real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
             re = torch.randn(*shape, dtype=real_dtype) * sigma
@@ -154,205 +68,113 @@ class GEMHSA(nn.Module):
             return nn.Parameter(torch.complex(re, im))
         return nn.Parameter(torch.randn(*shape, dtype=dtype) * sigma)
 
-    def _augment(self, W):
-        # Channel augmentation: (B, C, *Λ, nc, nc) -> (B, 2C+1, *Λ, nc, nc).
-        # Prepend the site-local identity, append the daggered channels.
-        spatial = W.shape[2:-2]
-        nc = W.shape[-1]
-        identity = torch.eye(nc, dtype=W.dtype, device=W.device).expand(
-            W.shape[0], 1, *spatial, nc, nc
-        )
-        return torch.cat([identity, W, self.gaugegroup.dagger(W)], dim=1)
-
     def _attend(self, Q, K, V, T):
-        """Gauge-equivariant attention over the L1-ball.
-        
-        Optimized version: processes offsets in a loop to save memory, 
-        and uses .contiguous() to satisfy torch.compile requirements.
-        """
+        # Fully batched version for speed, with aggressive contiguity for torch.compile
         nc = Q.shape[-1]
         B, H, d_qkv = Q.shape[:3]
         spatial = Q.shape[3:-2]
-        ndim_s = len(spatial)
+        
+        # 1. Neighbour gather
+        idx = tuple(self._nbr_idx[d] for d in range(self.D))
+        nb_indexer = (slice(None), slice(None), slice(None)) + idx + (slice(None), slice(None))
+        
+        # Ensure K, V are contiguous before slicing to keep inductor happy
+        K_nb = K.contiguous()[nb_indexer].contiguous()
+        V_nb = V.contiguous()[nb_indexer].contiguous()
 
-        # Pre-ensure contiguity for torch.compile
-        Q = Q.contiguous()
-        T = T.contiguous()
-        K = K.contiguous()
-        V = V.contiguous()
+        # 2. Adjoint transport
+        T_b = T.unsqueeze(1).unsqueeze(1).contiguous()
+        T_b_dag = self.gaugegroup.dagger(T_b).contiguous()
+        
+        K_tilde = (T_b @ K_nb @ T_b_dag).contiguous()
+        V_tilde = (T_b @ V_nb @ T_b_dag).contiguous()
 
-        # Score and value accumulators
-        # scores: (B, H, n_off, *Λ)
-        scores = []
-        # QdagV_sum: (B, H, d_qkv, *Λ, nc, nc)
-        # We'll compute softmax first, so we need all scores.
+        # 3. Score calculation
+        Q_e = Q.unsqueeze(3).contiguous()
+        score = (Q_e.conj().contiguous() * K_tilde).sum(dim=(2, -2, -1)).real
+        score = score / math.sqrt(self.d_qkv * nc)
+
+        # 4. Bias
+        bias = self.b_h[:, self._orbit_idx].contiguous()
+        if torch.is_complex(bias):
+            bias = bias.real
+        score = score + bias.view(1, self.H, self.n_offsets, *([1] * self.D))
+
+        # 5. Softmax
+        alpha = torch.softmax(score, dim=2)
+
+        # 6. Value path
+        Q_dag = self.gaugegroup.dagger(Q).unsqueeze(3).contiguous()
+        QdagV = torch.matmul(Q_dag, V_tilde).contiguous()
+        alpha_b = alpha.unsqueeze(2).unsqueeze(-1).unsqueeze(-1).contiguous()
         
-        # 1. Compute scores for all offsets
-        for i, offset in enumerate(self.offsets):
-            # Neighbour gather for this offset only
-            idx = tuple(self._nbr_idx[d, i] for d in range(self.D))
-            nb_indexer = (slice(None), slice(None), slice(None)) + idx + (slice(None), slice(None))
-            
-            K_nb = K[nb_indexer].contiguous()
-            T_off = T[:, i].unsqueeze(1).unsqueeze(1).contiguous()
-            T_off_dag = self.gaugegroup.dagger(T_off).contiguous()
-            
-            # K_tilde = T @ K_nb @ T_dag
-            K_tilde = T_off @ K_nb @ T_off_dag
-            
-            # score = Re Tr[Q† K_tilde] / sqrt(d*nc)
-            # Frobenius product: Tr[A† B] = (A.conj() * B).sum()
-            s = (Q.conj() * K_tilde).sum(dim=(2, -2, -1)).real
-            s = s / math.sqrt(self.d_qkv * nc)
-            
-            # Add orbit-tied bias
-            bias = self.b_h[:, self._orbit_idx[i]]
-            if torch.is_complex(bias):
-                bias = bias.real
-            s = s + bias.view(1, self.H, *([1] * ndim_s))
-            scores.append(s)
-            
-        # 2. Softmax over offsets
-        score_tensor = torch.stack(scores, dim=2) # (B, H, n_off, *Λ)
-        alpha = torch.softmax(score_tensor, dim=2)
-        
-        # 3. Value path: sum_i alpha_i * Q† * V_tilde_i
-        Q_dag = self.gaugegroup.dagger(Q).contiguous()
-        out = torch.zeros_like(Q)
-        
-        for i, offset in enumerate(self.offsets):
-            idx = tuple(self._nbr_idx[d, i] for d in range(self.D))
-            nb_indexer = (slice(None), slice(None), slice(None)) + idx + (slice(None), slice(None))
-            
-            V_nb = V[nb_indexer].contiguous()
-            T_off = T[:, i].unsqueeze(1).unsqueeze(1).contiguous()
-            T_off_dag = self.gaugegroup.dagger(T_off).contiguous()
-            
-            V_tilde = T_off @ V_nb @ T_off_dag
-            
-            # alpha_b: (B, H, *Λ)
-            alpha_b = alpha[:, :, i].unsqueeze(2).unsqueeze(-1).unsqueeze(-1)
-            
-            # out += alpha * Q† @ V_tilde
-            out = out + alpha_b * (Q_dag @ V_tilde)
-            
-        return out
+        return (alpha_b * QdagV).sum(dim=3).contiguous()
 
     def forward(self, W, T):
-        """Run the block.
-
-        ``W`` : covariant input field, ``(B, C, *Λ, nc, nc)``.
-        ``T`` : precomputed transports, ``(B, n_offsets, *Λ, nc, nc)`` with
-        offset axis ordered by ``self.offsets``.
-
-        Returns a tensor of the same shape as ``W``.
-        """
-
-        assert T.shape[1] == self.n_offsets, (
-            f"Expected T.shape[1] == {self.n_offsets} (number of offsets), got {T.shape[1]}"
-        )
-
         nc = W.shape[-1]
         B = W.shape[0]
         spatial = W.shape[2:-2]
         trailing = W.shape[2:]
 
-        # Optimized Q, K, V projection: avoid torch.cat and fuse matmuls.
-        # W_flat: (B, C, N*nc*nc)
-        W_flat = W.reshape(B, self.C, -1)
-        W_dag_flat = self.gaugegroup.dagger(W).reshape(B, self.C, -1)
+        # Optimized QKV: avoid torch.cat, use fused weights
+        W = W.contiguous()
+        W_flat = W.view(B, self.C, -1)
+        W_dag = self.gaugegroup.dagger(W).contiguous()
+        W_dag_flat = W_dag.view(B, self.C, -1)
         
-        # Fused weights: (3, H*d, 2C+1)
-        # We pre-calculate this or just stack it here. Stacking is cheap.
         w_QKV = torch.stack([
             self.w_Q.reshape(-1, self.C_tilde),
             self.w_K.reshape(-1, self.C_tilde),
             self.w_V.reshape(-1, self.C_tilde)
-        ]) # (3, H*d, 2C+1)
+        ]).contiguous()
         
-        # Contribution from Identity: w_QKV[:, :, 0] * I
-        # w_QKV[:, :, 0]: (3, H*d)
         qkv_id = w_QKV[:, :, 0].view(3, 1, self.H, self.d_qkv, *([1] * (len(spatial) + 2)))
-        
-        # Identity matrix: (nc, nc) -> (1, 1, 1, 1, *([1]*D), nc, nc)
         eye = torch.eye(nc, dtype=W.dtype, device=W.device)
-        for _ in range(4 + len(spatial)):
-            eye = eye.unsqueeze(0)
-            
-        QKV = qkv_id * eye # (3, 1, H, d_qkv, *Λ, nc, nc)
+        eye = eye.view(1, 1, 1, 1, *([1] * len(spatial)), nc, nc)
+        QKV = (qkv_id * eye).contiguous()
         
-        # Contributions from W and W_dag
-        # w_W: (3, H*d, C), w_W_dag: (3, H*d, C)
-        w_W = w_QKV[:, :, 1 : self.C + 1]
-        w_W_dag = w_QKV[:, :, self.C + 1 :]
+        w_W = w_QKV[:, :, 1 : self.C + 1].unsqueeze(1)
+        w_W_dag = w_QKV[:, :, self.C + 1 :].unsqueeze(1)
         
-        # We need to broadcast the 3 (Q,K,V) over the Batch dimension B.
-        # w_W: (3, 1, H*d, C), W_flat: (1, B, C, N) -> (3, B, H*d, N)
-        QKV_W = torch.matmul(w_W.unsqueeze(1), W_flat.unsqueeze(0)) + \
-                torch.matmul(w_W_dag.unsqueeze(1), W_dag_flat.unsqueeze(0))
-        QKV_W = QKV_W.view(3, B, self.H, self.d_qkv, *trailing)
+        QKV_W = torch.matmul(w_W, W_flat.unsqueeze(0)) + torch.matmul(w_W_dag, W_dag_flat.unsqueeze(0))
+        QKV_W = QKV_W.view(3, B, self.H, self.d_qkv, *trailing).contiguous()
         
-        QKV = QKV + QKV_W # (3, B, H, d_qkv, *Λ, nc, nc)
-        Q, K, V = QKV[0], QKV[1], QKV[2]
+        QKV = QKV + QKV_W
+        Q, K, V = QKV[0].contiguous(), QKV[1].contiguous(), QKV[2].contiguous()
 
-        # Transport, score, softmax, multiplicative value.
-        out = self._attend(Q, K, V, T)  # (B, H, d_qkv, *Λ, nc, nc)
+        out = self._attend(Q, K, V, T)
 
-        # Channel mix back to C output channels.
-        W_mix = torch.einsum("iha,bha...->bi...", self.w_mix, out)  # (B, C, *Λ, nc, nc)
+        W_mix = torch.einsum("iha,bha...->bi...", self.w_mix, out).contiguous()
 
-        # Residual + L-Act gate.
-        W_res = W + W_mix
+        # Residual + Gate: be very careful with contiguity for Inductor complex add decomposition
+        W_res = (W + W_mix).contiguous()
         trace_per_chan = W_res.diagonal(dim1=-2, dim2=-1).sum(-1).real / nc
-        if self.gate == "relu":
-            g = F.relu(trace_per_chan)
-        else:
-            g = F.softplus(trace_per_chan)
-        W_act = g.unsqueeze(-1).unsqueeze(-1) * W_res
-        return W + self.alpha * (W_act - W)
-
-
+        g = F.softplus(trace_per_chan) if self.gate == "softplus" else F.relu(trace_per_chan)
+        W_act = (g.unsqueeze(-1).unsqueeze(-1) * W_res).contiguous()
+        
+        # ReZero update
+        update = (W_act - W).contiguous()
+        return (W + self.alpha * update).contiguous()
 
 class Trace(nn.Module):
-    """Trace block: outputs the trace of the input field as a scalar per site.
-
-    This is a gauge-invariant quantity, so it can be used for supervised
-    regression tasks or as a readout head for classification.
-    """
-
     def forward(self, W):
-        # W: (B, C, *Λ, nc, nc) -> trace over color
-        trace = W.diagonal(dim1=-2, dim2=-1).sum(-1)  # (B, C, *Λ)
-        out = torch.cat([trace.real, trace.imag], dim=1)  # (B, 2C, *Λ)
-        return out
-
+        W = W.contiguous()
+        trace = W.diagonal(dim1=-2, dim2=-1).sum(-1)
+        return torch.cat([trace.real, trace.imag], dim=1).contiguous()
 
 class MLP(nn.Module):
     def __init__(self, in_features, hidden_features, out_features):
         super(MLP, self).__init__()
         self.fc1 = nn.Linear(in_features, hidden_features)
-
         self.fc2 = nn.Linear(hidden_features, out_features)
 
     def forward(self, x):
-        # (B, 2C, *Λ) -> (B, *Λ, 2C) so nn.Linear acts on the channel axis.
-        # reshape() would reinterpret memory and scramble the per-site vectors;
-        # movedim is the permutation we actually want.
-        x = x.movedim(1, -1)
+        x = x.movedim(1, -1).contiguous()
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
 
-
 class GELT(nn.Module):
-    """Full GELT model:
-    Pipeline:
-      1. Compute Plaq (+ optional Poly)
-      2. GEMHSA blocks with H heads and d_qkv channels per head.
-      3. Trace block to get Re, Im parts of the trace as scalar per site.
-      4. MLP with one hidden layer to mix the trace features and output a scalar per site for regression or classification.
-    """
-
     def __init__(
         self,
         gaugegroup,
@@ -367,44 +189,22 @@ class GELT(nn.Module):
         mlp_hidden=32,
         mlp_out=1,
     ):
-        # Plaquette input -> D(D-1)/2 plaquettes per site.
         d_input = D * (D - 1) // 2
         super(GELT, self).__init__()
-        # ModuleList so the GEMHSA parameters are registered with PyTorch
-        # and picked up by .parameters() / .to() / .state_dict().
-        self.gemhsa_models = nn.ModuleList(
-            [
-                GEMHSA(gaugegroup, L, D, R, d_input, nhead, d_qkv, gate, dtype)
-                for i in range(gemhsa_layers)
-            ]
-        )
-
-        # Trace produces real values, so the MLP must live in the matching
-        # real dtype — not the complex `dtype` of the GEMHSA stack. Blanket
-        # `.to(complex_dtype)` on GELT would otherwise miscast the MLP.
+        self.gemhsa_models = nn.ModuleList([
+            GEMHSA(gaugegroup, L, D, R, d_input, nhead, d_qkv, gate, dtype)
+            for _ in range(gemhsa_layers)
+        ])
         real_dtype = torch.float64 if dtype == torch.complex128 else torch.float32
         self.trace = Trace()
         self.mlp = MLP(2 * d_input, mlp_hidden, mlp_out).to(real_dtype)
-        # Zero-init the MLP's last linear layer: at init the model outputs 0
-        # at every site, so the untrained prediction is exactly 0. Paired
-        # with the train-script-side target standardization (notes/
-        # architecture.html §6.1), this makes the untrained model the
-        # constant predictor at the (normalized) target mean, i.e. R² = 0
-        # — the trivial mean-baseline. Gradients still flow on the first
-        # step via fc1 → fc2.
         nn.init.zeros_(self.mlp.fc2.weight)
         nn.init.zeros_(self.mlp.fc2.bias)
 
-    def attn(self, W, T):
+    def forward(self, W, T):
         for layer in self.gemhsa_models:
             W = layer(W, T)
-        return W
-
-    def forward(self, W, T):
-        W_attn = self.attn(W, T)
-        trace = self.trace(W_attn)
-        site_out = self.mlp(trace)  # (B, *Λ, mlp_out)
-        # Sum the site-local readout to an extensive scalar per config
-        # (matches the Wilson action target). squeeze(-1) handles mlp_out=1.
+        trace = self.trace(W)
+        site_out = self.mlp(trace)
         spatial_dims = tuple(range(1, site_out.ndim - 1))
         return site_out.sum(dim=spatial_dims).squeeze(-1)
