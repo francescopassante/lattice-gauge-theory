@@ -51,12 +51,12 @@ class GEMHSA(nn.Module):
 
         self.C_tilde = 2 * d_input + 1
         sigma = 0.02 / math.sqrt(self.C_tilde)
-        self.w_Q = self._init_projection((self.H, self.d_qkv, self.C_tilde), sigma, dtype)
-        self.w_K = self._init_projection((self.H, self.d_qkv, self.C_tilde), sigma, dtype)
-        self.w_V = self._init_projection((self.H, self.d_qkv, self.C_tilde), sigma, dtype)
+        self.w_Q = nn.Parameter(self._init_projection((self.H, self.d_qkv, self.C_tilde), sigma, dtype))
+        self.w_K = nn.Parameter(self._init_projection((self.H, self.d_qkv, self.C_tilde), sigma, dtype))
+        self.w_V = nn.Parameter(self._init_projection((self.H, self.d_qkv, self.C_tilde), sigma, dtype))
         
         sigma_mix = 0.02 / math.sqrt(self.H * self.d_qkv)
-        self.w_mix = self._init_projection((self.C, self.H, self.d_qkv), sigma_mix, dtype)
+        self.w_mix = nn.Parameter(self._init_projection((self.C, self.H, self.d_qkv), sigma_mix, dtype))
         self.alpha = nn.Parameter(torch.zeros(1))
 
     @staticmethod
@@ -65,8 +65,8 @@ class GEMHSA(nn.Module):
             real_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
             re = torch.randn(*shape, dtype=real_dtype) * sigma
             im = torch.randn(*shape, dtype=real_dtype) * sigma
-            return nn.Parameter(torch.complex(re, im))
-        return nn.Parameter(torch.randn(*shape, dtype=dtype) * sigma)
+            return torch.complex(re, im)
+        return torch.randn(*shape, dtype=dtype) * sigma
 
     def _resolve_dagger(self, U):
         return U.transpose(-1, -2).conj().resolve_conj().contiguous()
@@ -74,7 +74,7 @@ class GEMHSA(nn.Module):
     def _attend(self, Q, K, V, T):
         nc = Q.shape[-1]
         B, H, d_qkv = Q.shape[:3]
-        spatial = Q.shape[3:-2]
+        spatial_shape = Q.shape[3:-2]
         
         idx = tuple(self._nbr_idx[d] for d in range(self.D))
         nb_indexer = (slice(None), slice(None), slice(None)) + idx + (slice(None), slice(None))
@@ -88,63 +88,70 @@ class GEMHSA(nn.Module):
         K_tilde = (T_b @ K_nb @ T_b_dag).contiguous()
         V_tilde = (T_b @ V_nb @ T_b_dag).contiguous()
 
-        # Score Tr[Q† K_tilde]: (B, H, d, *Λ, nc, nc) x (B, H, d, n, *Λ, nc, nc) -> (B, H, n, *Λ)
+        # Score calculation: Tr[Q† @ K_tilde]
         Q_conj = Q.conj().resolve_conj().contiguous()
-        score = torch.einsum('bhd...ij,bhdn...ij->bhn...', Q_conj, K_tilde).real
-        score = score / math.sqrt(self.d_qkv * nc)
+        # Frobenius product via matmul + diagonal
+        # Q_conj: (B, H, d, *Λ, nc, nc), K_tilde: (B, H, d, n, *Λ, nc, nc)
+        Q_conj_e = Q_conj.unsqueeze(3).contiguous()
+        score = (Q_conj_e @ K_tilde).diagonal(dim1=-2, dim2=-1).sum(-1).real
+        # Sum over head dimension d
+        score = score.sum(dim=2) / math.sqrt(self.d_qkv * nc) # (B, H, n, *Λ)
 
         bias = self.b_h[:, self._orbit_idx].contiguous()
-        if torch.is_complex(bias):
-            bias = bias.real
+        if torch.is_complex(bias): bias = bias.real
         score = score + bias.view(1, self.H, self.n_offsets, *([1] * self.D))
 
-        alpha = torch.softmax(score, dim=2).to(Q.dtype)
+        alpha = torch.softmax(score, dim=2).to(Q.dtype) # (B, H, n, *Λ)
 
-        # Value path: sum_n alpha_n * (Q† @ V_tilde_n)
-        # alpha: (B, H, n, *Λ)
-        # Q_conj: (B, H, d, *Λ, nc, nc)
-        # V_tilde: (B, H, d, n, *Λ, nc, nc)
-        # Output: (B, H, d, *Λ, nc, nc)
-        # sum over n (offsets) and internal matrix index k
-        return torch.einsum('bhn...,bhdi...jk,bhdn...kl->bhdi...jl', alpha, Q_conj, V_tilde).contiguous()
+        # Value path: alpha * (Q† @ V_tilde)
+        QdagV = (Q_conj_e @ V_tilde).contiguous() # (B, H, d, n, *Λ, nc, nc)
+        alpha_b = alpha.unsqueeze(2).unsqueeze(-1).unsqueeze(-1) # (B, H, 1, n, *Λ, 1, 1)
+        return (alpha_b * QdagV).sum(dim=3).contiguous() # (B, H, d, *Λ, nc, nc)
 
     def forward(self, W, T):
         nc = W.shape[-1]
         B = W.shape[0]
         spatial = W.shape[2:-2]
+        trailing = W.shape[2:]
         
         W = W.contiguous()
         W_dag = self._resolve_dagger(W)
         
-        # Identity
+        # Fused QKV Projections via matmul
+        # Identity part
         qkv_id = torch.stack([self.w_Q[:,:,0], self.w_K[:,:,0], self.w_V[:,:,0]]) # (3, H, d)
         eye = torch.eye(nc, dtype=W.dtype, device=W.device)
-        QKV_id = torch.einsum('qhd,ij->qhdij', qkv_id, eye) # (3, H, d, nc, nc)
+        QKV_id = qkv_id.view(3, 1, self.H, self.d_qkv, 1, 1).matmul(eye.view(1, 1, 1, 1, nc, nc))
         QKV_id = QKV_id.view(3, 1, self.H, self.d_qkv, *([1]*len(spatial)), nc, nc).contiguous()
         
-        # W and W_dag
-        w_W = torch.stack([self.w_Q[:,:,1:self.C+1], self.w_K[:,:,1:self.C+1], self.w_V[:,:,1:self.C+1]]) # (3, H, d, C)
-        w_W_dag = torch.stack([self.w_Q[:,:,self.C+1:], self.w_K[:,:,self.C+1:], self.w_V[:,:,self.C+1:]]) # (3, H, d, C)
+        # W and W_dag part
+        # w_W: (3, H, d, C), W: (B, C, N*nc*nc)
+        w_W = torch.stack([self.w_Q[:,:,1:self.C+1], self.w_K[:,:,1:self.C+1], self.w_V[:,:,1:self.C+1]])
+        w_W_dag = torch.stack([self.w_Q[:,:,self.C+1:], self.w_K[:,:,self.C+1:], self.w_V[:,:,self.C+1:]])
         
-        # Projections
-        QKV_W = torch.einsum('qhdc,bc...ij->qbhd...ij', w_W, W) + \
-                torch.einsum('qhdc,bc...ij->qbhd...ij', w_W_dag, W_dag)
+        W_flat = W.view(B, self.C, -1)
+        W_dag_flat = W_dag.view(B, self.C, -1)
         
-        # Final Q, K, V
-        QKV = QKV_id + QKV_W.contiguous()
-        Q, K, V = QKV[0].contiguous(), QKV[1].contiguous(), QKV[2].contiguous()
+        # (3, H, d, C) @ (B, C, N*nc*nc) -> (3, B, H, d, N*nc*nc)
+        QKV_W = torch.matmul(w_W.unsqueeze(1), W_flat.unsqueeze(0)) + \
+                torch.matmul(w_W_dag.unsqueeze(1), W_dag_flat.unsqueeze(0))
+        QKV_W = QKV_W.view(3, B, self.H, self.d_qkv, *trailing).contiguous()
+        
+        QKV = QKV_id + QKV_W
+        Q, K, V = QKV[0], QKV[1], QKV[2]
 
-        # Attention
-        out = self._attend(Q, K, V, T)
+        out = self._attend(Q, K, V, T) # (B, H, d, *Λ, nc, nc)
 
-        # Output mixing
-        W_mix = torch.einsum('iha,bha...jk->bi...jk', self.w_mix, out).contiguous()
+        # Output Mix: (C, H, d) @ (B, H, d, *Λ, nc, nc) -> (B, C, *Λ, nc, nc)
+        # Reshape for matmul: (H*d, C) and (B, H*d, N*nc*nc)
+        w_mix_flat = self.w_mix.view(self.C, self.H * self.d_qkv)
+        out_flat = out.view(B, self.H * self.d_qkv, -1)
+        W_mix = torch.matmul(w_mix_flat, out_flat).view(B, self.C, *trailing).contiguous()
 
-        # Residual + Gate + ReZero
+        # Residual + Gate
         W_res = (W + W_mix).contiguous()
-        trace_per_chan = W_res.diagonal(dim1=-2, dim2=-1).sum(-1).real / nc
-        g = F.softplus(trace_per_chan) if self.gate == "softplus" else F.relu(trace_per_chan)
-        
+        trace = W_res.diagonal(dim1=-2, dim2=-1).sum(-1).real / nc
+        g = F.softplus(trace) if self.gate == "softplus" else F.relu(trace)
         W_act = (g.to(W.dtype).unsqueeze(-1).unsqueeze(-1) * W_res).contiguous()
         return (W + self.alpha.to(W.dtype) * (W_act - W)).contiguous()
 
